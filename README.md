@@ -11,4 +11,7 @@ Telegram bot for downloading Instagram media usiong Instaloader
 
 ```bash
 https://github.com/Nurmuhammad-Xusanov/eclipse-core.git
-cd ecli
+cd eclipse-core
+chmod +x setup.sh
+bash setup.sh
+```

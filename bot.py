@@ -52,14 +52,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = """
 Yo 👋
 
-Men Instagram’dan media ko‘chirib beradigan botman.
+Men Instagram'dan media ko'chirib beradigan botman.
 Link tashlaysan — men ishni bitiraman 😎
 
 ⚡ Qanday ishlaydi:
 1️⃣ IG post / reel / carousel linkini tashla
-2️⃣ Men media’ni olib beraman, gap yo‘q
+2️⃣ Men media'ni olib beraman, gap yo'q
 
-📦 Qo‘llab-quvvatlanadi:
+📦 Qo'llab-quvvatlanadi:
 • Post (rasm / video)
 • Reel (video)
 • Carousel (album holida)
@@ -74,7 +74,7 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # URL tekshirish
     if 'instagram.com' not in url:
-        await update.message.reply_text("❌ Bro bu Instagram link emas. To‘g‘risini tashla.")
+        await update.message.reply_text("❌ Bro bu Instagram link emas. To'g'risini tashla.")
         return
     
     # Shortcode'ni olish
@@ -117,28 +117,37 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for idx, filename in enumerate(all_files[:10]):  # Telegram 10 tagacha ruxsat beradi
                 filepath = os.path.join(temp_dir, filename)
                 try:
-                    with open(filepath, 'rb') as f:
-                        if filename.endswith('.mp4'):
-                            media_group.append(
-                                InputMediaVideo(
-                                    media=f.read(),
-                                    caption=caption if idx == 0 else None
-                                )
+                    # TUZATILDI: open() ni to'g'ridan-to'g'ri InputMedia ga beramiz
+                    if filename.endswith('.mp4'):
+                        media_group.append(
+                            InputMediaVideo(
+                                media=open(filepath, 'rb'),
+                                caption=caption if idx == 0 else None
                             )
-                        else:
-                            media_group.append(
-                                InputMediaPhoto(
-                                    media=f.read(),
-                                    caption=caption if idx == 0 else None
-                                )
+                        )
+                    else:
+                        media_group.append(
+                            InputMediaPhoto(
+                                media=open(filepath, 'rb'),
+                                caption=caption if idx == 0 else None
                             )
+                        )
                 except Exception as e:
                     print(f"Fayl o'qishda xatolik ({filename}): {e}")
             
             # Media group'ni yuborish
             if media_group:
-                await update.message.reply_media_group(media=media_group)
-                await status_msg.delete()
+                try:
+                    await update.message.reply_media_group(media=media_group)
+                    await status_msg.delete()
+                except Exception as e:
+                    print(f"Media group yuborishda xatolik: {e}")
+                    await status_msg.edit_text(f"❌ Yuborishda xatolik: {str(e)}")
+                finally:
+                    # File handle'larni yopish
+                    for media_item in media_group:
+                        if hasattr(media_item.media, 'close'):
+                            media_item.media.close()
             else:
                 await status_msg.edit_text("❌ Yuborish uchun fayllar tayyorlanmadi!")
         
@@ -155,9 +164,14 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             
             if video_file and os.path.exists(video_file):
-                with open(video_file, 'rb') as f:
-                    await update.message.reply_video(video=f, caption=caption)
-                await status_msg.delete()
+                try:
+                    with open(video_file, 'rb') as f:
+                        await update.message.reply_video(video=f, caption=caption)
+                    await status_msg.delete()
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ Video yuborishda xatolik: {str(e)}")
+            else:
+                await status_msg.edit_text("❌ Video fayli topilmadi!")
         
         # Agar bitta rasm bo'lsa
         else:
@@ -174,12 +188,22 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             
             if photo_file and os.path.exists(photo_file):
-                with open(photo_file, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption=caption)
-                await status_msg.delete()
+                try:
+                    with open(photo_file, 'rb') as f:
+                        await update.message.reply_photo(photo=f, caption=caption)
+                    await status_msg.delete()
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ Rasm yuborishda xatolik: {str(e)}")
             else:
                 await status_msg.edit_text("❌ Rasm fayli topilmadi!")
         
+    except instaloader.exceptions.InstaloaderException as e:
+        error_text = f"❌ Instagram xatolik: {str(e)}\n\n"
+        error_text += "💡 Sabablari:\n"
+        error_text += "• Post private bo'lishi mumkin\n"
+        error_text += "• Link noto'g'ri\n"
+        error_text += "• Instagram rate limit bergan"
+        await status_msg.edit_text(error_text)
     except Exception as e:
         error_text = f"❌ Xatolik yuz berdi: {str(e)}\n\n"
         error_text += "💡 Sabablari:\n"
@@ -188,19 +212,22 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error_text += "• Instagram tomonidan bloklangan"
         
         await status_msg.edit_text(error_text)
+        print(f"ERROR: {type(e).__name__}: {e}")
     
     finally:
         # Temporary fayllarni o'chirish
         if os.path.exists(temp_dir):
             for file in os.listdir(temp_dir):
                 try:
-                    os.remove(os.path.join(temp_dir, file))
-                except:
-                    pass
+                    filepath = os.path.join(temp_dir, file)
+                    if os.path.isfile(filepath):
+                        os.remove(filepath)
+                except Exception as e:
+                    print(f"Faylni o'chirishda xatolik: {e}")
             try:
                 os.rmdir(temp_dir)
-            except:
-                pass
+            except Exception as e:
+                print(f"Papkani o'chirishda xatolik: {e}")
 
 def main():
     """Botni ishga tushirish"""

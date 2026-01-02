@@ -78,7 +78,10 @@ async def download_youtube_shorts(update: Update, url: str):
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "cookiesfrombrowser": ("firefox",),
     }
+    
+    
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

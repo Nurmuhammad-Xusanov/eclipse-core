@@ -1,3 +1,5 @@
 python-telegram-bot
 instaloader
 python-dotenv
+yt-dlp
+browser-cookie3

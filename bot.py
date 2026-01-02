@@ -1,21 +1,26 @@
 import os
 import re
-import asyncio
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import yt_dlp
 import instaloader
 from instaloader import Post
 from dotenv import load_dotenv
 
+from telegram import Update, InputMediaPhoto, InputMediaVideo
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
 load_dotenv()
 
-# Bot token'ingizni bu yerga qo'ying
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi! .env ni tekshir")
+    raise ValueError("BOT_TOKEN topilmadi (.env ni tekshir)")
 
-# Instaloader ob'ektini yaratish
+# ================= INSTALOADER =================
 L = instaloader.Instaloader(
     download_video_thumbnails=False,
     compress_json=False,
@@ -25,224 +30,190 @@ L = instaloader.Instaloader(
     filename_pattern="{date_utc}_UTC"
 )
 
-# Session yaratish (403 error oldini olish)
-try:
-    # Agar session file mavjud bo'lsa, yuklab olish
-    if os.path.exists("session-file"):
+if os.path.exists("session-file"):
+    try:
         L.load_session_from_file("session-file")
-except:
-    pass
+    except:
+        pass
 
-def extract_shortcode(url):
-    """Instagram URL'dan shortcode'ni ajratib olish"""
+# ================= HELPERS =================
+def extract_shortcode(url: str):
     patterns = [
         r'instagram\.com/p/([^/\?]+)',
         r'instagram\.com/reel/([^/\?]+)',
         r'instagram\.com/tv/([^/\?]+)',
     ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
     return None
 
+
+def is_youtube_shorts(url: str) -> bool:
+    return "youtube.com/shorts/" in url or "youtu.be/" in url
+
+
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start komandasi"""
-    welcome_text = """
-Yo 👋
+    await update.message.reply_text(
+        "Yo 👋\n\n"
+        "Instagram + YouTube Shorts downloader botman.\n\n"
+        "👉 IG post / reel / carousel link\n"
+        "👉 YouTube Shorts link\n\n"
+        "Link tashla, qolganini menga qo‘y 😎"
+    )
 
-Men Instagram'dan media ko'chirib beradigan botman.
-Link tashlaysan — men ishni bitiraman 😎
 
-⚡ Qanday ishlaydi:
-1️⃣ IG post / reel / carousel linkini tashla
-2️⃣ Men media'ni olib beraman, gap yo'q
+# ================= YOUTUBE SHORTS =================
+async def download_youtube_shorts(update: Update, url: str):
+    status = await update.message.reply_text("⏳ YouTube Shorts yuklanmoqda...")
 
-📦 Qo'llab-quvvatlanadi:
-• Post (rasm / video)
-• Reel (video)
-• Carousel (album holida)
+    temp_dir = f"yt_{update.effective_user.id}"
+    os.makedirs(temp_dir, exist_ok=True)
 
-Boshladikmi? Linkni tashla 👇
-"""
-    await update.message.reply_text(welcome_text)
+    ydl_opts = {
+        "outtmpl": f"{temp_dir}/%(id)s.%(ext)s",
+        "format": "mp4",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+    }
 
-async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Instagram media'ni yuklab olish"""
-    url = update.message.text.strip()
-    
-    # URL tekshirish
-    if 'instagram.com' not in url:
-        await update.message.reply_text("❌ Bro bu Instagram link emas. To'g'risini tashla.")
-        return
-    
-    # Shortcode'ni olish
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        video_path = None
+        for f in os.listdir(temp_dir):
+            if f.endswith(".mp4"):
+                video_path = os.path.join(temp_dir, f)
+                break
+
+        if not video_path:
+            await status.edit_text("❌ Video topilmadi")
+            return
+
+        with open(video_path, "rb") as v:
+            await update.message.reply_video(
+                video=v,
+                caption="🎬 YouTube Shorts"
+            )
+
+        await status.delete()
+
+    except Exception as e:
+        await status.edit_text(f"❌ YouTube error: {e}")
+
+    finally:
+        for f in os.listdir(temp_dir):
+            os.remove(os.path.join(temp_dir, f))
+        os.rmdir(temp_dir)
+
+
+# ================= INSTAGRAM =================
+async def download_instagram(update: Update, url: str):
     shortcode = extract_shortcode(url)
     if not shortcode:
-        await update.message.reply_text("❌ Link formatida xatolik bor!")
+        await update.message.reply_text("❌ IG link noto‘g‘ri")
         return
-    
-    status_msg = await update.message.reply_text("⏳ Yuklanmoqda...")
-    
-    # Temporary papka yaratish
-    temp_dir = f"temp_{update.effective_user.id}"
+
+    status = await update.message.reply_text("⏳ Instagram yuklanmoqda...")
+    temp_dir = f"ig_{update.effective_user.id}"
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     try:
-        # Post ob'ektini olish
         post = Post.from_shortcode(L.context, shortcode)
-        
-        # Post haqida ma'lumot
-        caption = f"📸 Instagram Media\n"
+        caption = "📸 Instagram Media"
         if post.caption:
-            caption += f"\n{post.caption[:200]}{'...' if len(post.caption) > 200 else ''}"
-        
-        # Agar carousel bo'lsa
-        if post.typename == 'GraphSidecar':
-            await status_msg.edit_text("📦 Carousel yuklanmoqda...")
-            
-            # Avval barcha fayllarni yuklab olamiz
-            L.download_post(post, target=temp_dir)
-            
-            # Yuklab olingan fayllarni topamiz va turkumlaymiz
-            all_files = sorted([f for f in os.listdir(temp_dir) if f.endswith(('.jpg', '.mp4', '.png'))])
-            
-            if not all_files:
-                await status_msg.edit_text("❌ Fayllar topilmadi!")
-                return
-            
-            # Media group yaratish (maksimum 10 ta fayl)
-            media_group = []
-            for idx, filename in enumerate(all_files[:10]):  # Telegram 10 tagacha ruxsat beradi
-                filepath = os.path.join(temp_dir, filename)
-                try:
-                    # TUZATILDI: open() ni to'g'ridan-to'g'ri InputMedia ga beramiz
-                    if filename.endswith('.mp4'):
-                        media_group.append(
-                            InputMediaVideo(
-                                media=open(filepath, 'rb'),
-                                caption=caption if idx == 0 else None
-                            )
+            caption += f"\n\n{post.caption[:200]}"
+
+        L.download_post(post, target=temp_dir)
+        files = sorted(
+            f for f in os.listdir(temp_dir)
+            if f.endswith((".jpg", ".png", ".mp4"))
+        )
+
+        if not files:
+            await status.edit_text("❌ Media topilmadi")
+            return
+
+        # Carousel
+        if post.typename == "GraphSidecar":
+            media = []
+            for i, f in enumerate(files[:10]):
+                path = os.path.join(temp_dir, f)
+                if f.endswith(".mp4"):
+                    media.append(
+                        InputMediaVideo(
+                            media=open(path, "rb"),
+                            caption=caption if i == 0 else None
                         )
-                    else:
-                        media_group.append(
-                            InputMediaPhoto(
-                                media=open(filepath, 'rb'),
-                                caption=caption if idx == 0 else None
-                            )
+                    )
+                else:
+                    media.append(
+                        InputMediaPhoto(
+                            media=open(path, "rb"),
+                            caption=caption if i == 0 else None
                         )
-                except Exception as e:
-                    print(f"Fayl o'qishda xatolik ({filename}): {e}")
-            
-            # Media group'ni yuborish
-            if media_group:
-                try:
-                    await update.message.reply_media_group(media=media_group)
-                    await status_msg.delete()
-                except Exception as e:
-                    print(f"Media group yuborishda xatolik: {e}")
-                    await status_msg.edit_text(f"❌ Yuborishda xatolik: {str(e)}")
-                finally:
-                    # File handle'larni yopish
-                    for media_item in media_group:
-                        if hasattr(media_item.media, 'close'):
-                            media_item.media.close()
-            else:
-                await status_msg.edit_text("❌ Yuborish uchun fayllar tayyorlanmadi!")
-        
-        # Agar bitta video bo'lsa
+                    )
+
+            await update.message.reply_media_group(media)
+            for m in media:
+                m.media.close()
+
+        # Video
         elif post.is_video:
-            await status_msg.edit_text("🎥 Video yuklanmoqda...")
-            L.download_post(post, target=temp_dir)
-            
-            # Video faylni topish
-            video_file = None
-            for file in os.listdir(temp_dir):
-                if file.endswith('.mp4'):
-                    video_file = os.path.join(temp_dir, file)
+            for f in files:
+                if f.endswith(".mp4"):
+                    with open(os.path.join(temp_dir, f), "rb") as v:
+                        await update.message.reply_video(v, caption=caption)
                     break
-            
-            if video_file and os.path.exists(video_file):
-                try:
-                    with open(video_file, 'rb') as f:
-                        await update.message.reply_video(video=f, caption=caption)
-                    await status_msg.delete()
-                except Exception as e:
-                    await status_msg.edit_text(f"❌ Video yuborishda xatolik: {str(e)}")
-            else:
-                await status_msg.edit_text("❌ Video fayli topilmadi!")
-        
-        # Agar bitta rasm bo'lsa
+
+        # Photo
         else:
-            await status_msg.edit_text("🖼 Rasm yuklanmoqda...")
-            
-            # Post'ni yuklab olish
-            L.download_post(post, target=temp_dir)
-            
-            # Rasm faylni topish
-            photo_file = None
-            for file in os.listdir(temp_dir):
-                if file.endswith(('.jpg', '.png', '.jpeg')):
-                    photo_file = os.path.join(temp_dir, file)
+            for f in files:
+                if f.endswith((".jpg", ".png")):
+                    with open(os.path.join(temp_dir, f), "rb") as p:
+                        await update.message.reply_photo(p, caption=caption)
                     break
-            
-            if photo_file and os.path.exists(photo_file):
-                try:
-                    with open(photo_file, 'rb') as f:
-                        await update.message.reply_photo(photo=f, caption=caption)
-                    await status_msg.delete()
-                except Exception as e:
-                    await status_msg.edit_text(f"❌ Rasm yuborishda xatolik: {str(e)}")
-            else:
-                await status_msg.edit_text("❌ Rasm fayli topilmadi!")
-        
-    except instaloader.exceptions.InstaloaderException as e:
-        error_text = f"❌ Instagram xatolik: {str(e)}\n\n"
-        error_text += "💡 Sabablari:\n"
-        error_text += "• Post private bo'lishi mumkin\n"
-        error_text += "• Link noto'g'ri\n"
-        error_text += "• Instagram rate limit bergan"
-        await status_msg.edit_text(error_text)
+
+        await status.delete()
+
     except Exception as e:
-        error_text = f"❌ Xatolik yuz berdi: {str(e)}\n\n"
-        error_text += "💡 Sabablari:\n"
-        error_text += "• Post private bo'lishi mumkin\n"
-        error_text += "• Link noto'g'ri\n"
-        error_text += "• Instagram tomonidan bloklangan"
-        
-        await status_msg.edit_text(error_text)
-        print(f"ERROR: {type(e).__name__}: {e}")
-    
+        await status.edit_text(f"❌ Instagram error: {e}")
+
     finally:
-        # Temporary fayllarni o'chirish
-        if os.path.exists(temp_dir):
-            for file in os.listdir(temp_dir):
-                try:
-                    filepath = os.path.join(temp_dir, file)
-                    if os.path.isfile(filepath):
-                        os.remove(filepath)
-                except Exception as e:
-                    print(f"Faylni o'chirishda xatolik: {e}")
-            try:
-                os.rmdir(temp_dir)
-            except Exception as e:
-                print(f"Papkani o'chirishda xatolik: {e}")
+        for f in os.listdir(temp_dir):
+            os.remove(os.path.join(temp_dir, f))
+        os.rmdir(temp_dir)
 
+
+# ================= ROUTER =================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+
+    if "instagram.com" in url:
+        await download_instagram(update, url)
+        return
+
+    if is_youtube_shorts(url):
+        await download_youtube_shorts(update, url)
+        return
+
+    await update.message.reply_text("❌ Bu IG ham YT Shorts ham emas")
+
+
+# ================= MAIN =================
 def main():
-    """Botni ishga tushirish"""
-    print("🤖 Bot ishga tushmoqda...")
-    
-    # Application yaratish
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Handlerlarni qo'shish
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_media))
-    
-    # Botni ishga tushirish
-    print("✅ Bot ishga tushdi! Ctrl+C bilan to'xtatish mumkin.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 Bot ishga tushdi")
+    app = Application.builder().token(BOT_TOKEN).build()
 
-if __name__ == '__main__':
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
     main()

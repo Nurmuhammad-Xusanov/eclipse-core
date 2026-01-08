@@ -34,3 +34,4 @@ fi
 echo "🔥 Setup done. Run:"
 echo "source venv/bin/activate"
 echo "python bot.py"
+echo "NOTE: Make sure to add your cookies to cookies.txt for proper functionality."

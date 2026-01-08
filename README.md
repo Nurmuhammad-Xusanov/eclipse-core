@@ -33,10 +33,12 @@ If you can not afforf vps server like me, you can easily run it on yout phone vi
 
 ## Note
 
-Im currently using firefox so i used firefox cookies for bypass, if you use chrome or eddge or even other browser, you need to change the code. 
+Cookies has been updated. Fixed only local cookies. Make sure to add cookies to make fully functional bot. 
 
-```bash
-"cookiesfrombrowser": ("firefox",)
-```
+1.Dowload GetCookies extension for your browser
+2.Log in to your youtube account
+3.Use extension and import your cookies.
 
-finde this line from code and edit it if you use another browser. 
+After getting your cookies ready, put them project folder by naming ```cookies.txt``` if you want to rename, change the ``` "cookiefile": "cookies.txt"``` from ```bot.py``` 
+
+Thats all, enjoy!

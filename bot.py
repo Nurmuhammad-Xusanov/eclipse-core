@@ -100,8 +100,8 @@ def clean_caption(text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Eclipse Core online\n\n"
-        "IG + YouTube Shorts downloader\n\n"
-        "YT link tashla → sifatni tanlaysan 👇"
+        "Instagram + YouTube Shorts downloader\n\n"
+        "YT link → sifatni tanlaysan 👇"
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,7 +110,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Stats\n\n🔥 Bugun: {s['today']}\n📦 Jami: {s['total']}"
     )
 
-# ================= YOUTUBE CORE =================
+# ================= YOUTUBE =================
 def yt_download(url, outdir, height):
     ydl_opts = {
         "outtmpl": f"{outdir}/%(id)s.%(ext)s",
@@ -130,7 +130,6 @@ def yt_download(url, outdir, height):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-# ================= CALLBACK =================
 async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -178,18 +177,27 @@ async def handle_instagram(update, url):
 
     temp = f"ig_{uuid.uuid4().hex}"
     os.makedirs(temp, exist_ok=True)
-
     status = await update.message.reply_text("⏳ Instagram’dan yuklanmoqda...")
 
     try:
         post = await asyncio.to_thread(ig_download, shortcode, temp)
         caption = clean_caption(post.caption)
 
-        files = [
+        all_files = [
             os.path.join(temp, f)
             for f in os.listdir(temp)
             if f.endswith((".mp4", ".jpg", ".png"))
         ]
+
+        if post.typename == "GraphSidecar":
+            files = [
+                f for f in all_files
+                if re.search(r'_\d+\.(mp4|jpg|png)$', f)
+            ]
+        else:
+            files = all_files
+
+        files.sort()
 
         if not files:
             await status.edit_text("❌ Media topilmadi")
@@ -205,28 +213,20 @@ async def handle_instagram(update, url):
 
                 if f.endswith(".mp4"):
                     media.append(
-                        InputMediaVideo(
-                            open(f, "rb"),
-                            caption=caption if i == 0 else None
-                        )
+                        InputMediaVideo(open(f, "rb"), caption=caption if i == 0 else None)
                     )
                 else:
                     media.append(
-                        InputMediaPhoto(
-                            open(f, "rb"),
-                            caption=caption if i == 0 else None
-                        )
+                        InputMediaPhoto(open(f, "rb"), caption=caption if i == 0 else None)
                     )
 
             if media:
                 await update.message.reply_media_group(media)
                 for m in media:
                     m.media.close()
-            else:
-                await status.edit_text("❌ Fayllar juda katta")
 
         elif post.is_video:
-            with open(next(f for f in files if f.endswith(".mp4")), "rb") as v:
+            with open(files[0], "rb") as v:
                 await update.message.reply_video(v, caption=caption)
         else:
             with open(files[0], "rb") as p:
@@ -242,39 +242,10 @@ async def handle_instagram(update, url):
     finally:
         safe_cleanup(temp)
 
-    shortcode = extract_shortcode(url)
-    if not shortcode:
-        await update.message.reply_text("❌ IG link noto‘g‘ri")
-        return
-
-    temp = f"ig_{uuid.uuid4().hex}"
-    os.makedirs(temp, exist_ok=True)
-
-    try:
-        post = await asyncio.to_thread(ig_download, shortcode, temp)
-        caption = clean_caption(post.caption)
-
-        files = [
-            os.path.join(temp, f)
-            for f in os.listdir(temp)
-            if f.endswith((".mp4", ".jpg", ".png"))
-        ]
-
-        if post.is_video:
-            with open(next(f for f in files if f.endswith(".mp4")), "rb") as v:
-                await update.message.reply_video(v, caption=caption)
-        else:
-            with open(files[0], "rb") as p:
-                await update.message.reply_photo(p, caption=caption)
-
-        inc_stats()
-
-    finally:
-        safe_cleanup(temp)
-
 # ================= ROUTER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+
     if chat_id in ACTIVE_USERS:
         await update.message.reply_text("⏳ Kut, hozir ishlayapman")
         return

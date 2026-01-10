@@ -1,11 +1,11 @@
 import os
 import re
 import uuid
+import time
 import shutil
 import asyncio
+import traceback
 import json
-from datetime import date
-
 import yt_dlp
 import instaloader
 from instaloader import Post
@@ -275,19 +275,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         ACTIVE_USERS.discard(chat_id)
 
+
 # ================= MAIN =================
 def main():
     cleanup_on_start()
     print("🤖 Eclipse Core online")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    while True:
+        try:
+            app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CallbackQueryHandler(yt_quality_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("stats", stats_cmd))
+            app.add_handler(CallbackQueryHandler(yt_quality_callback))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.run_polling()
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                timeout=30,
+                close_loop=False,
+            )
+
+        except Exception as e:
+            print("⚠️ Connection lost, retrying...")
+            time.sleep(3)
 
 if __name__ == "__main__":
     main()
+

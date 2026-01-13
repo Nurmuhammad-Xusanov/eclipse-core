@@ -4,8 +4,8 @@ import uuid
 import time
 import shutil
 import asyncio
-import traceback
 import json
+from datetime import date
 import yt_dlp
 import instaloader
 from instaloader import Post
@@ -31,7 +31,7 @@ from telegram.ext import (
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN yo‘q")
+    raise RuntimeError("BOT_TOKEN yo'q")
 
 # ================= GLOBALS =================
 ACTIVE_USERS = set()
@@ -89,12 +89,15 @@ def extract_shortcode(url):
     return None
 
 def is_youtube(url):
-    return "youtube.com/shorts/" in url or "youtu.be/" in url
+    return "youtube.com/shorts/" in url or "youtu.be/" in url or "youtube.com/watch" in url
 
 def clean_caption(text):
     if not text:
         return "📥 Downloaded"
-    return re.sub(r"#\w+", "", text).strip()[:500]
+    # Remove hashtags and extra whitespace
+    cleaned = re.sub(r"#\w+", "", text).strip()
+    # Limit to 500 characters
+    return cleaned[:500] if cleaned else "📥 Downloaded"
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,7 +119,6 @@ def yt_download(url, outdir, height):
         "outtmpl": f"{outdir}/%(id)s.%(ext)s",
         "quiet": True,
         "no_warnings": True,
-        "cookiefile": "cookies.txt",
         "format": f"bv*[height<={height}][fps<=30]/bv*+ba/b",
         "merge_output_format": "mp4",
         "postprocessors": [
@@ -138,7 +140,7 @@ async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     url = PENDING_YT.pop(chat_id, None)
 
     if not url:
-        await query.edit_message_text("❌ Session yo‘q, qayta link tashla")
+        await query.edit_message_text("❌ Session yo'q, qayta link tashla")
         return
 
     height = 720 if query.data == "yt_720" else 1080
@@ -149,7 +151,13 @@ async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         await asyncio.to_thread(yt_download, url, temp, height)
-        file = next(os.path.join(temp, f) for f in os.listdir(temp))
+        
+        files = [f for f in os.listdir(temp) if os.path.isfile(os.path.join(temp, f))]
+        if not files:
+            await query.edit_message_text("❌ Video yuklanmadi")
+            return
+            
+        file = os.path.join(temp, files[0])
 
         if os.path.getsize(file) > 50 * 1024 * 1024:
             await query.edit_message_text("❌ Video 50MB dan katta")
@@ -159,6 +167,11 @@ async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_video(v, caption=f"🎬 YouTube {height}p")
 
         inc_stats()
+        await query.message.delete()
+
+    except Exception as e:
+        print("YT ERROR:", e)
+        await query.edit_message_text("❌ YouTube yuklashda xatolik")
 
     finally:
         safe_cleanup(temp)
@@ -172,15 +185,23 @@ def ig_download(shortcode, outdir):
 async def handle_instagram(update, url):
     shortcode = extract_shortcode(url)
     if not shortcode:
-        await update.message.reply_text("❌ Instagram link noto‘g‘ri")
+        await update.message.reply_text("❌ Instagram link noto'g'ri")
         return
 
     temp = f"ig_{uuid.uuid4().hex}"
     os.makedirs(temp, exist_ok=True)
-    status = await update.message.reply_text("⏳ Instagram’dan yuklanmoqda...")
+    status = await update.message.reply_text("⏳ Instagram'dan yuklanmoqda...")
 
+    post = None
     try:
         post = await asyncio.to_thread(ig_download, shortcode, temp)
+    except Exception as e:
+        await status.edit_text("❌ Instagram yuklashda xatolik")
+        print("IG DOWNLOAD ERROR:", e)
+        safe_cleanup(temp)
+        return
+
+    try:
         caption = clean_caption(post.caption)
 
         all_files = [
@@ -189,6 +210,7 @@ async def handle_instagram(update, url):
             if f.endswith((".mp4", ".jpg", ".png"))
         ]
 
+        # Handle carousel posts (multiple images/videos)
         if post.typename == "GraphSidecar":
             files = [
                 f for f in all_files
@@ -203,8 +225,9 @@ async def handle_instagram(update, url):
             await status.edit_text("❌ Media topilmadi")
             return
 
-        await status.edit_text("📤 Telegram’ga yuborilmoqda...")
+        await status.edit_text("📤 Telegram'ga yuborilmoqda...")
 
+        # Handle carousel posts
         if post.typename == "GraphSidecar":
             media = []
             for i, f in enumerate(files[:10]):
@@ -225,9 +248,11 @@ async def handle_instagram(update, url):
                 for m in media:
                     m.media.close()
 
+        # Handle single video
         elif post.is_video:
             with open(files[0], "rb") as v:
                 await update.message.reply_video(v, caption=caption)
+        # Handle single photo
         else:
             with open(files[0], "rb") as p:
                 await update.message.reply_photo(p, caption=caption)
@@ -236,8 +261,8 @@ async def handle_instagram(update, url):
         await status.delete()
 
     except Exception as e:
-        await status.edit_text("❌ Instagram yuklashda xatolik")
-        print("IG ERROR:", e)
+        await status.edit_text("❌ Media yuborishda xatolik")
+        print("IG SEND ERROR:", e)
 
     finally:
         safe_cleanup(temp)
@@ -270,8 +295,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard
             )
         else:
-            await update.message.reply_text("❌ Qo‘llab-quvvatlanmaydi")
+            await update.message.reply_text("❌ Qo'llab-quvvatlanmaydi")
 
+    except Exception as e:
+        print("HANDLE ERROR:", e)
+        await update.message.reply_text("❌ Xatolik yuz berdi")
     finally:
         ACTIVE_USERS.discard(chat_id)
 
@@ -298,8 +326,8 @@ def main():
 
         except Exception as e:
             print("⚠️ Connection lost, retrying...")
+            print(f"Error: {e}")
             time.sleep(3)
 
 if __name__ == "__main__":
     main()
-

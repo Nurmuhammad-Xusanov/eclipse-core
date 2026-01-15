@@ -33,6 +33,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN yo'q")
 
+# ================= PATHS =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
+
 # ================= GLOBALS =================
 ACTIVE_USERS = set()
 PENDING_YT = {}  # chat_id -> url
@@ -128,6 +132,12 @@ def yt_download(url, outdir, height):
             }
         ],
     }
+    
+    # Add cookies if file exists
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
+    else:
+        print(f"⚠️ WARNING: cookies.txt not found at {COOKIES_FILE}")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -171,7 +181,14 @@ async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         print("YT ERROR:", e)
-        await query.edit_message_text("❌ YouTube yuklashda xatolik")
+        error_msg = str(e)
+        if "Sign in" in error_msg or "bot" in error_msg:
+            await query.edit_message_text(
+                "❌ YouTube cookies eskirgan!\n"
+                "cookies.txt ni yangilang."
+            )
+        else:
+            await query.edit_message_text("❌ YouTube yuklashda xatolik")
 
     finally:
         safe_cleanup(temp)
@@ -307,6 +324,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     cleanup_on_start()
+    
+    # Check cookies file on startup
+    if os.path.exists(COOKIES_FILE):
+        print(f"✅ cookies.txt found at: {COOKIES_FILE}")
+    else:
+        print(f"⚠️ WARNING: cookies.txt NOT found at: {COOKIES_FILE}")
+        print("   YouTube downloads may fail without cookies!")
+    
     print("🤖 Eclipse Core online")
 
     while True:

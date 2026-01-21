@@ -133,7 +133,6 @@ def yt_download(url, outdir, height):
         ],
     }
     
-    # Add cookies if file exists
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
     else:
@@ -208,8 +207,8 @@ async def handle_instagram(update, url):
     temp = f"ig_{uuid.uuid4().hex}"
     os.makedirs(temp, exist_ok=True)
     status = await update.message.reply_text("⏳ Instagram'dan yuklanmoqda...")
-
     post = None
+
     try:
         post = await asyncio.to_thread(ig_download, shortcode, temp)
     except Exception as e:
@@ -220,18 +219,15 @@ async def handle_instagram(update, url):
 
     try:
         caption = clean_caption(post.caption)
-
         all_files = [
             os.path.join(temp, f)
             for f in os.listdir(temp)
             if f.endswith((".mp4", ".jpg", ".png"))
         ]
 
-        # Handle carousel posts (multiple images/videos)
         if post.typename == "GraphSidecar":
             files = [
-                f for f in all_files
-                if re.search(r'_\d+\.(mp4|jpg|png)$', f)
+                f for f in all_files if re.search(r'_\d+\.(mp4|jpg|png)$', f)
             ]
         else:
             files = all_files
@@ -244,32 +240,36 @@ async def handle_instagram(update, url):
 
         await status.edit_text("📤 Telegram'ga yuborilmoqda...")
 
-        # Handle carousel posts
         if post.typename == "GraphSidecar":
             media = []
+            opened_files = []
+            
             for i, f in enumerate(files[:10]):
                 if os.path.getsize(f) > 50 * 1024 * 1024:
                     continue
-
+                
+                file_obj = open(f, "rb")
+                opened_files.append(file_obj)
+                
                 if f.endswith(".mp4"):
                     media.append(
-                        InputMediaVideo(open(f, "rb"), caption=caption if i == 0 else None)
+                        InputMediaVideo(file_obj, caption=caption if i == 0 else None)
                     )
                 else:
                     media.append(
-                        InputMediaPhoto(open(f, "rb"), caption=caption if i == 0 else None)
+                        InputMediaPhoto(file_obj, caption=caption if i == 0 else None)
                     )
-
+            
             if media:
                 await update.message.reply_media_group(media)
-                for m in media:
-                    m.media.close()
+                
+                # Fayllarni yuborilgandan keyin yopamiz
+                for file_obj in opened_files:
+                    file_obj.close()
 
-        # Handle single video
         elif post.is_video:
             with open(files[0], "rb") as v:
                 await update.message.reply_video(v, caption=caption)
-        # Handle single photo
         else:
             with open(files[0], "rb") as p:
                 await update.message.reply_photo(p, caption=caption)
@@ -280,7 +280,6 @@ async def handle_instagram(update, url):
     except Exception as e:
         await status.edit_text("❌ Media yuborishda xatolik")
         print("IG SEND ERROR:", e)
-
     finally:
         safe_cleanup(temp)
 
@@ -320,12 +319,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         ACTIVE_USERS.discard(chat_id)
 
-
 # ================= MAIN =================
 def main():
     cleanup_on_start()
     
-    # Check cookies file on startup
     if os.path.exists(COOKIES_FILE):
         print(f"✅ cookies.txt found at: {COOKIES_FILE}")
     else:

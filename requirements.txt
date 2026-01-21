@@ -3,3 +3,4 @@ instaloader
 python-dotenv
 yt-dlp
 browser-cookie3
+httpx

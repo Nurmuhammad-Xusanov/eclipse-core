@@ -7,22 +7,17 @@ import asyncio
 import json
 from datetime import date
 import yt_dlp
-import instaloader
-from instaloader import Post
 from dotenv import load_dotenv
 
 from telegram import (
     Update,
     InputMediaPhoto,
     InputMediaVideo,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -30,6 +25,7 @@ from telegram.ext import (
 # ================= ENV =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN yo'q")
 
@@ -39,7 +35,6 @@ COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 
 # ================= GLOBALS =================
 ACTIVE_USERS = set()
-PENDING_YT = {}  # chat_id -> url
 STATS_FILE = "stats.json"
 
 # ================= STATS =================
@@ -62,15 +57,6 @@ def inc_stats():
     stats["total"] += 1
     save_stats(stats)
 
-# ================= INSTAGRAM =================
-L = instaloader.Instaloader(
-    download_video_thumbnails=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    post_metadata_txt_pattern="",
-)
-
 # ================= HELPERS =================
 def safe_cleanup(path):
     if os.path.exists(path):
@@ -78,37 +64,24 @@ def safe_cleanup(path):
 
 def cleanup_on_start():
     for f in os.listdir():
-        if f.startswith(("ig_", "yt_")):
+        if f.startswith("ig_"):
             shutil.rmtree(f, ignore_errors=True)
 
-def extract_shortcode(url):
-    for p in (
-        r"instagram\.com/p/([^/?]+)",
-        r"instagram\.com/reel/([^/?]+)",
-        r"instagram\.com/tv/([^/?]+)",
-    ):
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
-
-def is_youtube(url):
-    return "youtube.com/shorts/" in url or "youtu.be/" in url or "youtube.com/watch" in url
+def is_instagram(url):
+    return "instagram.com" in url
 
 def clean_caption(text):
     if not text:
         return "📥 Downloaded"
-    # Remove hashtags and extra whitespace
-    cleaned = re.sub(r"#\w+", "", text).strip()
-    # Limit to 500 characters
-    return cleaned[:500] if cleaned else "📥 Downloaded"
+    text = re.sub(r"#\w+", "", text).strip()
+    return text[:500] if text else "📥 Downloaded"
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Eclipse Core online\n\n"
-        "Instagram + YouTube Shorts downloader\n\n"
-        "YT link → sifatni tanlaysan 👇"
+        "📥 Instagram downloader\n"
+        "Post / Reel / Carousel"
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,169 +90,115 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Stats\n\n🔥 Bugun: {s['today']}\n📦 Jami: {s['total']}"
     )
 
-# ================= YOUTUBE =================
-def yt_download(url, outdir, height):
+# ================= INSTAGRAM =================
+def ig_download(url, outdir):
     ydl_opts = {
         "outtmpl": f"{outdir}/%(id)s.%(ext)s",
         "quiet": True,
         "no_warnings": True,
-        "format": f"bv*[height<={height}][fps<=30]/bv*+ba/b",
-        "merge_output_format": "mp4",
-        "postprocessors": [
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }
-        ],
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "referer": "https://www.instagram.com/",
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 3,
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
     }
-    
+
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
-    else:
-        print(f"⚠️ WARNING: cookies.txt not found at {COOKIES_FILE}")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-async def yt_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    url = PENDING_YT.pop(chat_id, None)
-
-    if not url:
-        await query.edit_message_text("❌ Session yo'q, qayta link tashla")
-        return
-
-    height = 720 if query.data == "yt_720" else 1080
-    temp = f"yt_{uuid.uuid4().hex}"
-    os.makedirs(temp, exist_ok=True)
-
-    await query.edit_message_text(f"⏳ YouTube {height}p yuklanmoqda...")
-
-    try:
-        await asyncio.to_thread(yt_download, url, temp, height)
-        
-        files = [f for f in os.listdir(temp) if os.path.isfile(os.path.join(temp, f))]
-        if not files:
-            await query.edit_message_text("❌ Video yuklanmadi")
-            return
-            
-        file = os.path.join(temp, files[0])
-
-        if os.path.getsize(file) > 50 * 1024 * 1024:
-            await query.edit_message_text("❌ Video 50MB dan katta")
-            return
-
-        with open(file, "rb") as v:
-            await query.message.reply_video(v, caption=f"🎬 YouTube {height}p")
-
-        inc_stats()
-        await query.message.delete()
-
-    except Exception as e:
-        print("YT ERROR:", e)
-        error_msg = str(e)
-        if "Sign in" in error_msg or "bot" in error_msg:
-            await query.edit_message_text(
-                "❌ YouTube cookies eskirgan!\n"
-                "cookies.txt ni yangilang."
-            )
-        else:
-            await query.edit_message_text("❌ YouTube yuklashda xatolik")
-
-    finally:
-        safe_cleanup(temp)
-
-# ================= INSTAGRAM =================
-def ig_download(shortcode, outdir):
-    post = Post.from_shortcode(L.context, shortcode)
-    L.download_post(post, target=outdir)
-    return post
+        return ydl.extract_info(url, download=True)
 
 async def handle_instagram(update, url):
-    shortcode = extract_shortcode(url)
-    if not shortcode:
-        await update.message.reply_text("❌ Instagram link noto'g'ri")
-        return
-
     temp = f"ig_{uuid.uuid4().hex}"
     os.makedirs(temp, exist_ok=True)
+
     status = await update.message.reply_text("⏳ Instagram'dan yuklanmoqda...")
-    post = None
 
     try:
-        post = await asyncio.to_thread(ig_download, shortcode, temp)
-    except Exception as e:
-        await status.edit_text("❌ Instagram yuklashda xatolik")
-        print("IG DOWNLOAD ERROR:", e)
-        safe_cleanup(temp)
-        return
-
-    try:
-        caption = clean_caption(post.caption)
-        all_files = [
-            os.path.join(temp, f)
-            for f in os.listdir(temp)
-            if f.endswith((".mp4", ".jpg", ".png"))
-        ]
-
-        if post.typename == "GraphSidecar":
-            files = [
-                f for f in all_files if re.search(r'_\d+\.(mp4|jpg|png)$', f)
-            ]
-        else:
-            files = all_files
-
-        files.sort()
-
-        if not files:
-            await status.edit_text("❌ Media topilmadi")
+        info = await asyncio.to_thread(ig_download, url, temp)
+        if not info:
             return
 
+        caption = clean_caption(info.get("description", ""))
+
+        files = [
+            os.path.join(temp, f)
+            for f in os.listdir(temp)
+            if f.endswith((".mp4", ".jpg", ".png", ".webp"))
+        ]
+
+        if not files:
+            return
+
+        files.sort()
         await status.edit_text("📤 Telegram'ga yuborilmoqda...")
 
-        if post.typename == "GraphSidecar":
+        # ===== ALBUM =====
+        if len(files) > 1:
             media = []
-            opened_files = []
-            
+            opened = []
+
             for i, f in enumerate(files[:10]):
                 if os.path.getsize(f) > 50 * 1024 * 1024:
                     continue
-                
-                file_obj = open(f, "rb")
-                opened_files.append(file_obj)
-                
+
+                fo = open(f, "rb")
+                opened.append(fo)
+
                 if f.endswith(".mp4"):
                     media.append(
-                        InputMediaVideo(file_obj, caption=caption if i == 0 else None)
+                        InputMediaVideo(
+                            fo,
+                            caption=caption if i == 0 else None
+                        )
                     )
                 else:
                     media.append(
-                        InputMediaPhoto(file_obj, caption=caption if i == 0 else None)
+                        InputMediaPhoto(
+                            fo,
+                            caption=caption if i == 0 else None
+                        )
                     )
-            
-            if media:
-                await update.message.reply_media_group(media)
-                
-                # Fayllarni yuborilgandan keyin yopamiz
-                for file_obj in opened_files:
-                    file_obj.close()
 
-        elif post.is_video:
-            with open(files[0], "rb") as v:
-                await update.message.reply_video(v, caption=caption)
+            if media:
+                try:
+                    await update.message.reply_media_group(media)
+                except Exception as e:
+                    print("MEDIA GROUP ERROR:", e)
+
+            for fo in opened:
+                fo.close()
+
+        # ===== SINGLE =====
         else:
-            with open(files[0], "rb") as p:
-                await update.message.reply_photo(p, caption=caption)
+            f = files[0]
+            try:
+                if f.endswith(".mp4"):
+                    with open(f, "rb") as v:
+                        await update.message.reply_video(v, caption=caption)
+                else:
+                    with open(f, "rb") as p:
+                        await update.message.reply_photo(p, caption=caption)
+            except Exception as e:
+                print("SEND ERROR:", e)
 
         inc_stats()
-        await status.delete()
+
+        try:
+            await status.delete()
+        except:
+            pass
 
     except Exception as e:
-        await status.edit_text("❌ Media yuborishda xatolik")
-        print("IG SEND ERROR:", e)
+        print("IG ERROR:", e)
+
     finally:
         safe_cleanup(temp)
 
@@ -295,40 +214,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         url = update.message.text.strip()
 
-        if "instagram.com" in url:
+        if is_instagram(url):
             await handle_instagram(update, url)
-
-        elif is_youtube(url):
-            PENDING_YT[chat_id] = url
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🎥 720p", callback_data="yt_720"),
-                    InlineKeyboardButton("🔥 1080p", callback_data="yt_1080"),
-                ]
-            ])
-            await update.message.reply_text(
-                "Qaysi sifatda yuklaymiz?",
-                reply_markup=keyboard
-            )
         else:
-            await update.message.reply_text("❌ Qo'llab-quvvatlanmaydi")
+            await update.message.reply_text("❌ Faqat Instagram link")
 
     except Exception as e:
         print("HANDLE ERROR:", e)
-        await update.message.reply_text("❌ Xatolik yuz berdi")
+
     finally:
         ACTIVE_USERS.discard(chat_id)
 
 # ================= MAIN =================
 def main():
     cleanup_on_start()
-    
-    if os.path.exists(COOKIES_FILE):
-        print(f"✅ cookies.txt found at: {COOKIES_FILE}")
-    else:
-        print(f"⚠️ WARNING: cookies.txt NOT found at: {COOKIES_FILE}")
-        print("   YouTube downloads may fail without cookies!")
-    
+
     print("🤖 Eclipse Core online")
 
     while True:
@@ -337,8 +237,9 @@ def main():
 
             app.add_handler(CommandHandler("start", start))
             app.add_handler(CommandHandler("stats", stats_cmd))
-            app.add_handler(CallbackQueryHandler(yt_quality_callback))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            app.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+            )
 
             app.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -347,8 +248,8 @@ def main():
             )
 
         except Exception as e:
-            print("⚠️ Connection lost, retrying...")
-            print(f"Error: {e}")
+            print("⚠️ Restarting...")
+            print(e)
             time.sleep(3)
 
 if __name__ == "__main__":

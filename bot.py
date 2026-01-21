@@ -25,7 +25,6 @@ from telegram.ext import (
 # ================= ENV =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN yo'q")
 
@@ -133,7 +132,6 @@ async def handle_instagram(update, url):
             for f in os.listdir(temp)
             if f.endswith((".mp4", ".jpg", ".png", ".webp"))
         ]
-
         if not files:
             return
 
@@ -142,30 +140,18 @@ async def handle_instagram(update, url):
 
         # ===== ALBUM =====
         if len(files) > 1:
-            media = []
-            opened = []
-
+            media, opened = [], []
             for i, f in enumerate(files[:10]):
                 if os.path.getsize(f) > 50 * 1024 * 1024:
                     continue
-
                 fo = open(f, "rb")
                 opened.append(fo)
 
-                if f.endswith(".mp4"):
-                    media.append(
-                        InputMediaVideo(
-                            fo,
-                            caption=caption if i == 0 else None
-                        )
-                    )
-                else:
-                    media.append(
-                        InputMediaPhoto(
-                            fo,
-                            caption=caption if i == 0 else None
-                        )
-                    )
+                media.append(
+                    InputMediaVideo(fo, caption=caption if i == 0 else None)
+                    if f.endswith(".mp4")
+                    else InputMediaPhoto(fo, caption=caption if i == 0 else None)
+                )
 
             if media:
                 try:
@@ -191,8 +177,9 @@ async def handle_instagram(update, url):
 
         inc_stats()
 
+        await asyncio.sleep(0.5)
         try:
-            await status.delete()
+            await status.edit_text("✅ Yuklandi!")
         except:
             pass
 
@@ -205,7 +192,6 @@ async def handle_instagram(update, url):
 # ================= ROUTER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
     if chat_id in ACTIVE_USERS:
         await update.message.reply_text("⏳ Kut, hozir ishlayapman")
         return
@@ -213,43 +199,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE_USERS.add(chat_id)
     try:
         url = update.message.text.strip()
-
         if is_instagram(url):
             await handle_instagram(update, url)
         else:
             await update.message.reply_text("❌ Faqat Instagram link")
-
-    except Exception as e:
-        print("HANDLE ERROR:", e)
-
     finally:
         ACTIVE_USERS.discard(chat_id)
 
 # ================= MAIN =================
 def main():
     cleanup_on_start()
-
     print("🤖 Eclipse Core online")
 
     while True:
         try:
             app = Application.builder().token(BOT_TOKEN).build()
-
             app.add_handler(CommandHandler("start", start))
             app.add_handler(CommandHandler("stats", stats_cmd))
-            app.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-            )
-
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                timeout=30,
-                close_loop=False,
-            )
-
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30, close_loop=False)
         except Exception as e:
-            print("⚠️ Restarting...")
-            print(e)
+            print("⚠️ Restarting:", e)
             time.sleep(3)
 
 if __name__ == "__main__":

@@ -80,146 +80,257 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Eclipse Core online\n\n"
         "📥 Instagram downloader\n"
-        "Post / Reel / Carousel"
+        "✅ Post / Reel / Carousel / Story\n\n"
+        "🔗 Link yuboring va yuklab olaman!"
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = load_stats()
     await update.message.reply_text(
-        f"📊 Stats\n\n🔥 Bugun: {s['today']}\n📦 Jami: {s['total']}"
+        f"📊 Statistika\n\n🔥 Bugun: {s['today']}\n📦 Jami: {s['total']}"
     )
 
 # ================= INSTAGRAM =================
 def ig_download(url, outdir):
+    """Instagram'dan rasmlar, video, carousel, story yuklab olish"""
+    
     ydl_opts = {
-        "outtmpl": f"{outdir}/%(id)s.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "referer": "https://www.instagram.com/",
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 3,
-        "sleep_interval": 2,
-        "max_sleep_interval": 5,
+        "outtmpl": f"{outdir}/%(id)s_%(autonumber)s.%(ext)s",
+        "quiet": False,
+        "no_warnings": False,
+        "format": "best",
+        "merge_output_format": "mp4",
+        
+        # Headers
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/16.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.instagram.com/",
+            "DNT": "1",
+        },
+        
+        # Network options
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
+        "sleep_interval": 1,
+        "max_sleep_interval": 3,
+        "socket_timeout": 30,
+        
+        # Postprocessor
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
+        
+        # Extract all media
+        "writesubtitles": False,
+        "writethumbnail": False,
+        "extract_flat": False,
     }
 
+    # Cookies
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=True)
+        return info
+
+def get_media_files(directory):
+    """Katalogdagi barcha media fayllari"""
+    media = []
+    
+    if not os.path.exists(directory):
+        return media
+    
+    for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+        
+        # Faqat media fayllari
+        if filename.endswith((".mp4", ".jpg", ".jpeg", ".png", ".webp")):
+            # Faylni type bo'yicha ajratish
+            if filename.endswith(".mp4"):
+                media.append({"path": filepath, "type": "video"})
+            else:
+                media.append({"path": filepath, "type": "photo"})
+    
+    # Nom bo'yicha sort (tartib saqlansin)
+    media.sort(key=lambda x: x["path"])
+    return media
+
+async def send_media_group(update, media_files, caption):
+    """Media gruppani yuborish"""
+    media_group = []
+    opened_files = []
+    
+    try:
+        for i, item in enumerate(media_files[:10]):  # Max 10ta
+            # Fayl hajmini tekshirish
+            if os.path.getsize(item["path"]) > 50 * 1024 * 1024:  # 50MB
+                continue
+            
+            file_obj = open(item["path"], "rb")
+            opened_files.append(file_obj)
+            
+            # Birinchi elementga caption
+            cap = caption if i == 0 else None
+            
+            if item["type"] == "video":
+                media_group.append(InputMediaVideo(file_obj, caption=cap))
+            else:
+                media_group.append(InputMediaPhoto(file_obj, caption=cap))
+        
+        if media_group:
+            await update.message.reply_media_group(media_group)
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Media group yuborishda xato: {e}")
+        return False
+        
+    finally:
+        # Fayllarni yopish
+        for f in opened_files:
+            try:
+                f.close()
+            except:
+                pass
+
+async def send_single_media(update, media_file, caption):
+    """Bitta media yuborish"""
+    try:
+        with open(media_file["path"], "rb") as f:
+            if media_file["type"] == "video":
+                await update.message.reply_video(f, caption=caption)
+            else:
+                await update.message.reply_photo(f, caption=caption)
+        return True
+    except Exception as e:
+        print(f"❌ Media yuborishda xato: {e}")
+        return False
 
 async def handle_instagram(update, url):
-    temp = f"ig_{uuid.uuid4().hex}"
-    os.makedirs(temp, exist_ok=True)
+    """Instagram kontentni yuklab olish va yuborish"""
+    temp_dir = f"ig_{uuid.uuid4().hex}"
+    os.makedirs(temp_dir, exist_ok=True)
 
-    status = await update.message.reply_text("⏳ Instagram'dan yuklanmoqda...")
+    status_msg = await update.message.reply_text("⏳ Instagram'dan yuklanmoqda...")
 
     try:
-        info = await asyncio.to_thread(ig_download, url, temp)
+        # Yuklab olish
+        info = await asyncio.to_thread(ig_download, url, temp_dir)
+        
         if not info:
+            await status_msg.edit_text("❌ Yuklab bo'lmadi")
             return
 
-        caption = clean_caption(info.get("description", ""))
-
-        files = [
-            os.path.join(temp, f)
-            for f in os.listdir(temp)
-            if f.endswith((".mp4", ".jpg", ".png", ".webp"))
-        ]
-        if not files:
+        # Caption tayyorlash
+        caption = clean_caption(info.get("description") or info.get("title", ""))
+        
+        # Media fayllarni olish
+        media_files = get_media_files(temp_dir)
+        
+        if not media_files:
+            await status_msg.edit_text("❌ Media fayl topilmadi")
             return
 
-        files.sort()
-        await status.edit_text("📤 Telegram'ga yuborilmoqda...")
+        await status_msg.edit_text("📤 Telegram'ga yuborilmoqda...")
 
-        # ===== ALBUM =====
-        if len(files) > 1:
-            media, opened = [], []
-            for i, f in enumerate(files[:10]):
-                if os.path.getsize(f) > 50 * 1024 * 1024:
-                    continue
-                fo = open(f, "rb")
-                opened.append(fo)
-
-                media.append(
-                    InputMediaVideo(fo, caption=caption if i == 0 else None)
-                    if f.endswith(".mp4")
-                    else InputMediaPhoto(fo, caption=caption if i == 0 else None)
-                )
-
-            if media:
-                try:
-                    await update.message.reply_media_group(media)
-                except Exception as e:
-                    print("MEDIA GROUP ERROR:", e)
-
-            for fo in opened:
-                fo.close()
-
-        # ===== SINGLE =====
+        # Yuborish
+        success = False
+        if len(media_files) > 1:
+            # Carousel yoki ko'p media
+            success = await send_media_group(update, media_files, caption)
         else:
-            f = files[0]
+            # Bitta media
+            success = await send_single_media(update, media_files[0], caption)
+
+        if success:
+            inc_stats()
+            await asyncio.sleep(0.3)
             try:
-                if f.endswith(".mp4"):
-                    with open(f, "rb") as v:
-                        await update.message.reply_video(v, caption=caption)
-                else:
-                    with open(f, "rb") as p:
-                        await update.message.reply_photo(p, caption=caption)
-            except Exception as e:
-                print("SEND ERROR:", e)
+                await status_msg.edit_text("✅ Yuklandi!")
+            except:
+                pass
+        else:
+            await status_msg.edit_text("❌ Yuborishda xatolik")
 
-        inc_stats()
-
-        await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f"❌ Instagram xato: {e}")
         try:
-            await status.edit_text("✅ Yuklandi!")
+            await status_msg.edit_text(f"❌ Xatolik: {str(e)[:100]}")
         except:
             pass
 
-    except Exception as e:
-        print("IG ERROR:", e)
-
     finally:
-        safe_cleanup(temp)
+        # Tozalash
+        await asyncio.sleep(1)
+        safe_cleanup(temp_dir)
 
-# ================= ROUTER =================
+# ================= MESSAGE HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Barcha xabarlarni boshqarish"""
     chat_id = update.effective_chat.id
+    
+    # Agar user allaqachon ishlayotgan bo'lsa
     if chat_id in ACTIVE_USERS:
-        await update.message.reply_text("⏳ Kut, hozir ishlayapman")
+        await update.message.reply_text("⏳ Kutib turing, oldingi yuklanish tugashini...")
         return
 
     ACTIVE_USERS.add(chat_id)
+    
     try:
         url = update.message.text.strip()
+        
         if is_instagram(url):
             await handle_instagram(update, url)
         else:
-            await update.message.reply_text("❌ Faqat Instagram link")
+            await update.message.reply_text(
+                "❌ Faqat Instagram havolalari qo'llab-quvvatlanadi\n\n"
+                "📌 Qo'llab-quvvatlanadi:\n"
+                "• Post (rasm/video)\n"
+                "• Reel\n"
+                "• Carousel\n"
+                "• Story"
+            )
+    
     finally:
         ACTIVE_USERS.discard(chat_id)
 
 # ================= MAIN =================
 def main():
+    """Botni ishga tushirish"""
     cleanup_on_start()
     print("🤖 Eclipse Core online")
+    print("📥 Instagram downloader ishga tushdi")
 
     while True:
         try:
             app = Application.builder().token(BOT_TOKEN).build()
+            
+            # Handlerlar
             app.add_handler(CommandHandler("start", start))
             app.add_handler(CommandHandler("stats", stats_cmd))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30, close_loop=False)
+            
+            # Polling
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                timeout=30,
+                close_loop=False
+            )
+            
         except Exception as e:
-            print("⚠️ Restarting:", e)
+            print(f"⚠️ Xatolik yuz berdi: {e}")
+            print("🔄 3 soniyadan keyin qayta uriniladi...")
             time.sleep(3)
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import asyncio
 import json
 from datetime import date
 from pathlib import Path
+
 import instaloader
 from dotenv import load_dotenv
 
@@ -29,7 +30,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN yo'q")
 
-# Instagram login (opsiyonal, private contentlar uchun)
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
@@ -41,7 +41,7 @@ SESSION_FILE = os.path.join(BASE_DIR, "insta_session")
 ACTIVE_USERS = set()
 STATS_FILE = "stats.json"
 
-# Instaloader setup
+# ================= INSTALOADER =================
 L = instaloader.Instaloader(
     download_video_thumbnails=False,
     download_geotags=False,
@@ -50,31 +50,27 @@ L = instaloader.Instaloader(
     compress_json=False,
     post_metadata_txt_pattern="",
     quiet=True,
-    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 )
 
-# Login (agar credentials berilgan bo'lsa)
+L.context.raise_all_errors = True  # JSON bullshitni kesamiz
+
 def instaloader_login():
-    """Instaloader'ga login qilish"""
     try:
         if os.path.exists(SESSION_FILE):
             L.load_session_from_file(INSTAGRAM_USERNAME, SESSION_FILE)
-            print("✅ Session yuklandi")
-            return True
-        
+            print("✅ Instagram session loaded")
+            return
+
         if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
             L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
             L.save_session_to_file(SESSION_FILE)
-            print("✅ Login muvaffaqiyatli")
-            return True
-        
-        print("⚠️ Login ma'lumotlari yo'q, public content'ga cheklanadi")
-        return False
-    except Exception as e:
-        print(f"⚠️ Login xato: {e}")
-        return False
+            print("✅ Instagram logged in")
+            return
 
-# Login qilish
+        print("⚠️ Login yo‘q — faqat public content")
+    except Exception as e:
+        print(f"⚠️ Instagram login error: {e}")
+
 instaloader_login()
 
 # ================= STATS =================
@@ -99,11 +95,7 @@ def inc_stats():
 
 # ================= HELPERS =================
 def safe_cleanup(path):
-    if os.path.exists(path):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-        except:
-            pass
+    shutil.rmtree(path, ignore_errors=True)
 
 def cleanup_on_start():
     for f in os.listdir():
@@ -117,342 +109,157 @@ def clean_caption(text):
     if not text:
         return "📥 Instagram"
     text = re.sub(r"#\w+", "", text).strip()
-    return text[:1000] if text else "📥 Instagram"
+    return text[:1000] or "📥 Instagram"
 
 def extract_shortcode(url):
-    """URL dan shortcode olish"""
-    patterns = [
-        r'instagram\.com/p/([A-Za-z0-9_-]+)',
-        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
-        r'instagram\.com/tv/([A-Za-z0-9_-]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
+    m = re.search(r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
+    return m.group(1) if m else None
 
-def extract_story_info(url):
-    """Story URL dan username va story_id olish"""
-    match = re.search(r'instagram\.com/stories/([^/]+)/(\d+)', url)
-    if match:
-        return match.group(1), match.group(2)
-    return None, None
+def extract_story_or_highlight(url):
+    story = re.search(r'instagram\.com/stories/([^/]+)/(\d+)', url)
+    if story:
+        return "story", story.group(1), story.group(2)
 
-# ================= COMMANDS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Eclipse Core online\n\n"
-        "📥 Instagram downloader\n"
-        "✅ Post / Reel / Carousel / Story\n\n"
-        "🔗 Link yuboring!"
-    )
+    highlight = re.search(r'instagram\.com/stories/highlights/(\d+)', url)
+    if highlight:
+        return "highlight", None, highlight.group(1)
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = load_stats()
-    await update.message.reply_text(
-        f"📊 Statistika\n\n🔥 Bugun: {s['today']}\n📦 Jami: {s['total']}"
-    )
+    return None, None, None
 
-# ================= DOWNLOAD FUNCTIONS =================
+# ================= DOWNLOAD =================
 def download_post(shortcode, temp_dir):
-    """Post/Reel/Carousel yuklash"""
-    try:
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        
-        # Target papka
-        target = temp_dir
-        
-        # Postni yuklash
-        L.download_post(post, target=target)
-        
-        return {
-            "caption": post.caption if post.caption else "",
-            "success": True
-        }
-    except Exception as e:
-        print(f"❌ Download post error: {e}")
-        return {"success": False, "error": str(e)}
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    L.download_post(post, target=temp_dir)
+    return {"success": True, "caption": post.caption or ""}
 
 def download_story(username, story_id, temp_dir):
-    """Story yuklash"""
-    try:
-        # Profile olish
-        profile = instaloader.Profile.from_username(L.context, username)
-        
-        # Storylarni yuklash
-        for story in L.get_stories(userids=[profile.userid]):
-            for item in story.get_items():
-                if str(item.mediaid) == story_id:
+    profile = instaloader.Profile.from_username(L.context, username)
+    for story in L.get_stories(userids=[profile.userid]):
+        for item in story.get_items():
+            if str(item.mediaid).endswith(story_id):
+                L.download_storyitem(item, target=temp_dir)
+                return {"success": True, "caption": "📥 Story"}
+    return {"success": False, "error": "Story topilmadi yoki o‘chgan"}
+
+def download_highlight(highlight_id, temp_dir):
+    if not L.context.is_logged_in:
+        return {"success": False, "error": "Highlight uchun login shart"}
+
+    for profile in instaloader.Profile.from_id(
+        L.context, L.context.user_id
+    ).get_followees():
+        for h in profile.get_highlights():
+            if str(h.unique_id) == str(highlight_id):
+                for item in h.get_items():
                     L.download_storyitem(item, target=temp_dir)
-                    return {"success": True, "caption": "📥 Story"}
-        
-        return {"success": False, "error": "Story topilmadi"}
-    except Exception as e:
-        print(f"❌ Download story error: {e}")
-        return {"success": False, "error": str(e)}
+                return {"success": True, "caption": "📥 Highlight"}
 
-# ================= GET MEDIA FILES =================
+    return {"success": False, "error": "Highlight topilmadi yoki private"}
+
+# ================= MEDIA =================
 def get_media_files(directory):
-    """Katalogdagi barcha media fayllarni olish"""
     media = []
-    
-    if not os.path.exists(directory):
-        return media
-    
-    # Barcha fayllarni ko'rib chiqish
-    for file_path in Path(directory).rglob("*"):
-        if not file_path.is_file():
-            continue
-        
-        ext = file_path.suffix.lower()
-        
-        # Faqat media fayllar
-        if ext in ['.mp4', '.mov', '.avi']:
-            media.append({"path": str(file_path), "type": "video"})
-        elif ext in ['.jpg', '.jpeg', '.png', '.webp']:
-            media.append({"path": str(file_path), "type": "photo"})
-    
-    # Nom bo'yicha sort
-    media.sort(key=lambda x: x["path"])
-    return media
+    for f in Path(directory).rglob("*"):
+        if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
+            media.append({
+                "path": str(f),
+                "type": "video" if f.suffix.lower() == ".mp4" else "photo"
+            })
+    return sorted(media, key=lambda x: x["path"])
 
-# ================= SEND FUNCTIONS =================
-async def send_media_group(update, media_files, caption):
-    """Media gruppani yuborish (carousel)"""
-    if len(media_files) > 10:
-        media_files = media_files[:10]
-    
-    media_group = []
-    opened_files = []
-    
-    try:
-        for i, item in enumerate(media_files):
-            # Hajm tekshirish (50MB Telegram limit)
-            file_size = os.path.getsize(item["path"])
-            if file_size > 50 * 1024 * 1024:
-                print(f"⚠️ Fayl juda katta: {item['path']} ({file_size} bytes)")
-                continue
-            
-            file_obj = open(item["path"], "rb")
-            opened_files.append(file_obj)
-            
-            # Faqat birinchi elementga caption
-            cap = caption if i == 0 else None
-            
-            if item["type"] == "video":
-                media_group.append(InputMediaVideo(
-                    media=file_obj,
-                    caption=cap,
-                    supports_streaming=True
-                ))
+# ================= SEND =================
+async def send_media(update, media, caption):
+    if len(media) == 1:
+        with open(media[0]["path"], "rb") as f:
+            if media[0]["type"] == "video":
+                await update.message.reply_video(video=f, caption=caption)
             else:
-                media_group.append(InputMediaPhoto(
-                    media=file_obj,
-                    caption=cap
-                ))
-        
-        if not media_group:
-            return False
-        
-        # Yuborish
-        await update.message.reply_media_group(
-            media=media_group,
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=120
-        )
-        return True
-        
-    except Exception as e:
-        print(f"❌ Media group error: {e}")
-        return False
-        
-    finally:
-        # Fayllarni yopish
-        for f in opened_files:
-            try:
-                f.close()
-            except:
-                pass
+                await update.message.reply_photo(photo=f, caption=caption)
+        return
 
-async def send_single_media(update, media_file, caption):
-    """Bitta media yuborish"""
-    try:
-        file_size = os.path.getsize(media_file["path"])
-        
-        # Hajm tekshirish
-        if file_size > 50 * 1024 * 1024:
-            await update.message.reply_text(
-                f"❌ Fayl hajmi juda katta: {file_size / 1024 / 1024:.1f}MB\n"
-                "Telegram limiti: 50MB"
-            )
-            return False
-        
-        with open(media_file["path"], "rb") as f:
-            if media_file["type"] == "video":
-                await update.message.reply_video(
-                    video=f,
-                    caption=caption,
-                    supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=120
-                )
-            else:
-                await update.message.reply_photo(
-                    photo=f,
-                    caption=caption,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=120
-                )
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Send media error: {e}")
-        return False
-
-# ================= MAIN HANDLER =================
-async def handle_instagram(update, url):
-    """Instagram yuklab olish va yuborish"""
-    temp_dir = f"ig_{uuid.uuid4().hex}"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    status_msg = await update.message.reply_text("⏳ Yuklanmoqda...")
-
-    try:
-        # Story yoki Post?
-        username, story_id = extract_story_info(url)
-        
-        if username and story_id:
-            # STORY
-            result = await asyncio.to_thread(download_story, username, story_id, temp_dir)
-            caption = result.get("caption", "📥 Story")
+    group = []
+    files = []
+    for i, m in enumerate(media[:10]):
+        f = open(m["path"], "rb")
+        files.append(f)
+        if m["type"] == "video":
+            group.append(InputMediaVideo(f, caption=caption if i == 0 else None))
         else:
-            # POST / REEL / CAROUSEL
+            group.append(InputMediaPhoto(f, caption=caption if i == 0 else None))
+
+    await update.message.reply_media_group(group)
+    for f in files:
+        f.close()
+
+# ================= HANDLER =================
+async def handle_instagram(update, url):
+    temp_dir = f"ig_{uuid.uuid4().hex}"
+    os.makedirs(temp_dir)
+
+    status = await update.message.reply_text("⏳ Yuklanmoqda...")
+
+    try:
+        kind, user, cid = extract_story_or_highlight(url)
+
+        if kind == "story":
+            result = await asyncio.to_thread(download_story, user, cid, temp_dir)
+        elif kind == "highlight":
+            result = await asyncio.to_thread(download_highlight, cid, temp_dir)
+        else:
             shortcode = extract_shortcode(url)
             if not shortcode:
-                await status_msg.edit_text("❌ Noto'g'ri Instagram link")
+                await status.edit_text("❌ Noto‘g‘ri link")
                 return
-            
             result = await asyncio.to_thread(download_post, shortcode, temp_dir)
-            caption = clean_caption(result.get("caption", ""))
-        
-        if not result.get("success", False):
-            error = result.get("error", "Noma'lum xato")
-            await status_msg.edit_text(f"❌ Yuklanmadi: {error}")
+
+        if not result["success"]:
+            await status.edit_text(f"❌ {result['error']}")
             return
 
-        # Media fayllarni olish
-        await asyncio.sleep(1)  # Fayllar yozilishini kutish
-        media_files = get_media_files(temp_dir)
-        
-        if not media_files:
-            await status_msg.edit_text("❌ Media fayllar topilmadi")
+        media = get_media_files(temp_dir)
+        if not media:
+            await status.edit_text("❌ Media topilmadi")
             return
 
-        await status_msg.edit_text(f"📤 Yuborilmoqda... ({len(media_files)} fayl)")
+        await status.delete()
+        await send_media(update, media, clean_caption(result.get("caption", "")))
+        inc_stats()
 
-        # Yuborish
-        success = False
-        
-        if len(media_files) == 1:
-            # Bitta fayl
-            success = await send_single_media(update, media_files[0], caption)
-        else:
-            # Carousel (ko'p fayl)
-            success = await send_media_group(update, media_files, caption)
-
-        if success:
-            inc_stats()
-            await asyncio.sleep(0.5)
-            
-            # Status xabarni o'chirish
-            try:
-                await status_msg.delete()
-            except:
-                try:
-                    await status_msg.edit_text("✅ Yuklandi!")
-                except:
-                    pass
-        else:
-            await status_msg.edit_text("❌ Yuborishda xatolik yuz berdi")
-
+    except json.JSONDecodeError:
+        await status.edit_text("❌ Instagram vaqtincha javob bermadi")
     except Exception as e:
-        print(f"❌ Handle Instagram error: {e}")
-        try:
-            await status_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
-        except:
-            pass
-
+        await status.edit_text(f"❌ Xato: {str(e)[:200]}")
     finally:
-        # Tozalash
-        await asyncio.sleep(2)
         safe_cleanup(temp_dir)
 
-# ================= MESSAGE HANDLER =================
+# ================= MESSAGE =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xabarlarni qayta ishlash"""
     chat_id = update.effective_chat.id
-    
-    # User allaqachon ishlayotgan bo'lsa
     if chat_id in ACTIVE_USERS:
-        await update.message.reply_text("⏳ Kutib turing, oldingi yuklash tugashini...")
+        await update.message.reply_text("⏳ Kutib tur...")
         return
 
     ACTIVE_USERS.add(chat_id)
-    
     try:
         url = update.message.text.strip()
-        
         if is_instagram(url):
             await handle_instagram(update, url)
         else:
-            await update.message.reply_text(
-                "❌ Faqat Instagram havolalari\n\n"
-                "✅ Qo'llab-quvvatlanadi:\n"
-                "• Post (rasm/video)\n"
-                "• Reel\n"
-                "• Carousel\n"
-                "• Story"
-            )
-    
+            await update.message.reply_text("❌ Faqat Instagram link")
     finally:
         ACTIVE_USERS.discard(chat_id)
 
 # ================= MAIN =================
 def main():
-    """Botni ishga tushirish"""
     cleanup_on_start()
-    print("🤖 Eclipse Core online")
-    print("📥 Instagram downloader ready")
+    print("🤖 Eclipse Core ONLINE")
 
-    while True:
-        try:
-            app = Application.builder().token(BOT_TOKEN).build()
-            
-            # Handlerlar
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("stats", stats_cmd))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            
-            # Polling
-            print("🚀 Bot ishga tushdi")
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                timeout=30,
-                close_loop=False
-            )
-            
-        except KeyboardInterrupt:
-            print("\n👋 Bot to'xtatildi")
-            break
-        except Exception as e:
-            print(f"⚠️ Xatolik: {e}")
-            print("🔄 5 soniyadan keyin qayta ishga tushiriladi...")
-            time.sleep(5)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("📥 Instagram downloader")))
+    app.add_handler(CommandHandler("stats", lambda u, c: u.message.reply_text(str(load_stats()))))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

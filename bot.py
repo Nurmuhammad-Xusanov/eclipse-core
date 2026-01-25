@@ -1,7 +1,6 @@
 import os
 import re
 import uuid
-import time
 import shutil
 import asyncio
 import json
@@ -9,6 +8,7 @@ from datetime import date
 from pathlib import Path
 
 import instaloader
+import instaloader.structures
 from dotenv import load_dotenv
 
 from telegram import (
@@ -23,6 +23,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+# ================= INSTALOADER JSON KILL =================
+instaloader.structures.Post._field_structure = {}
+instaloader.structures.PostSidecarNode._field_structure = {}
+
 
 # ================= ENV =================
 load_dotenv()
@@ -52,24 +57,16 @@ L = instaloader.Instaloader(
     quiet=True,
 )
 
-L.context.raise_all_errors = True  # JSON bullshitni kesamiz
-
 def instaloader_login():
     try:
         if os.path.exists(SESSION_FILE):
             L.load_session_from_file(INSTAGRAM_USERNAME, SESSION_FILE)
-            print("✅ Instagram session loaded")
             return
-
         if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
             L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
             L.save_session_to_file(SESSION_FILE)
-            print("✅ Instagram logged in")
-            return
-
-        print("⚠️ Login yo‘q — faqat public content")
-    except Exception as e:
-        print(f"⚠️ Instagram login error: {e}")
+    except:
+        pass
 
 instaloader_login()
 
@@ -85,13 +82,13 @@ def save_stats(stats):
         json.dump(stats, f)
 
 def inc_stats():
-    stats = load_stats()
-    if stats["date"] != str(date.today()):
-        stats["date"] = str(date.today())
-        stats["today"] = 0
-    stats["today"] += 1
-    stats["total"] += 1
-    save_stats(stats)
+    s = load_stats()
+    if s["date"] != str(date.today()):
+        s["date"] = str(date.today())
+        s["today"] = 0
+    s["today"] += 1
+    s["total"] += 1
+    save_stats(s)
 
 # ================= HELPERS =================
 def safe_cleanup(path):
@@ -105,32 +102,24 @@ def cleanup_on_start():
 def is_instagram(url):
     return "instagram.com" in url
 
-def clean_caption(text):
-    if not text:
-        return "📥 Instagram"
-    text = re.sub(r"#\w+", "", text).strip()
-    return text[:1000] or "📥 Instagram"
-
 def extract_shortcode(url):
     m = re.search(r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
     return m.group(1) if m else None
 
 def extract_story_or_highlight(url):
-    story = re.search(r'instagram\.com/stories/([^/]+)/(\d+)', url)
-    if story:
-        return "story", story.group(1), story.group(2)
-
-    highlight = re.search(r'instagram\.com/stories/highlights/(\d+)', url)
-    if highlight:
-        return "highlight", None, highlight.group(1)
-
+    s = re.search(r'instagram\.com/stories/([^/]+)/(\d+)', url)
+    if s:
+        return "story", s.group(1), s.group(2)
+    h = re.search(r'instagram\.com/stories/highlights/(\d+)', url)
+    if h:
+        return "highlight", None, h.group(1)
     return None, None, None
 
 # ================= DOWNLOAD =================
 def download_post(shortcode, temp_dir):
     post = instaloader.Post.from_shortcode(L.context, shortcode)
     L.download_post(post, target=temp_dir)
-    return {"success": True, "caption": post.caption or ""}
+    return {"success": True}
 
 def download_story(username, story_id, temp_dir):
     profile = instaloader.Profile.from_username(L.context, username)
@@ -138,23 +127,19 @@ def download_story(username, story_id, temp_dir):
         for item in story.get_items():
             if str(item.mediaid).endswith(story_id):
                 L.download_storyitem(item, target=temp_dir)
-                return {"success": True, "caption": "📥 Story"}
-    return {"success": False, "error": "Story topilmadi yoki o‘chgan"}
+                return {"success": True}
+    return {"success": False, "error": "Story topilmadi"}
 
 def download_highlight(highlight_id, temp_dir):
     if not L.context.is_logged_in:
-        return {"success": False, "error": "Highlight uchun login shart"}
-
-    for profile in instaloader.Profile.from_id(
-        L.context, L.context.user_id
-    ).get_followees():
+        return {"success": False, "error": "Login kerak"}
+    for profile in instaloader.Profile.from_id(L.context, L.context.user_id).get_followees():
         for h in profile.get_highlights():
             if str(h.unique_id) == str(highlight_id):
                 for item in h.get_items():
                     L.download_storyitem(item, target=temp_dir)
-                return {"success": True, "caption": "📥 Highlight"}
-
-    return {"success": False, "error": "Highlight topilmadi yoki private"}
+                return {"success": True}
+    return {"success": False, "error": "Highlight topilmadi"}
 
 # ================= MEDIA =================
 def get_media_files(directory):
@@ -168,25 +153,24 @@ def get_media_files(directory):
     return sorted(media, key=lambda x: x["path"])
 
 # ================= SEND =================
-async def send_media(update, media, caption):
+async def send_media(update, media):
     if len(media) == 1:
         with open(media[0]["path"], "rb") as f:
             if media[0]["type"] == "video":
-                await update.message.reply_video(video=f, caption=caption)
+                await update.message.reply_video(video=f)
             else:
-                await update.message.reply_photo(photo=f, caption=caption)
+                await update.message.reply_photo(photo=f)
         return
 
     group = []
     files = []
-    for i, m in enumerate(media[:10]):
+    for m in media[:10]:
         f = open(m["path"], "rb")
         files.append(f)
         if m["type"] == "video":
-            group.append(InputMediaVideo(f, caption=caption if i == 0 else None))
+            group.append(InputMediaVideo(f))
         else:
-            group.append(InputMediaPhoto(f, caption=caption if i == 0 else None))
-
+            group.append(InputMediaPhoto(f))
     await update.message.reply_media_group(group)
     for f in files:
         f.close()
@@ -222,13 +206,11 @@ async def handle_instagram(update, url):
             return
 
         await status.delete()
-        await send_media(update, media, clean_caption(result.get("caption", "")))
+        await send_media(update, media)
         inc_stats()
 
-    except json.JSONDecodeError:
+    except Exception:
         await status.edit_text("❌ Instagram vaqtincha javob bermadi")
-    except Exception as e:
-        await status.edit_text(f"❌ Xato: {str(e)[:200]}")
     finally:
         safe_cleanup(temp_dir)
 
@@ -236,9 +218,7 @@ async def handle_instagram(update, url):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in ACTIVE_USERS:
-        await update.message.reply_text("⏳ Kutib tur...")
         return
-
     ACTIVE_USERS.add(chat_id)
     try:
         url = update.message.text.strip()
@@ -252,13 +232,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     cleanup_on_start()
-    print("🤖 Eclipse Core ONLINE")
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("📥 Instagram downloader")))
-    app.add_handler(CommandHandler("stats", lambda u, c: u.message.reply_text(str(load_stats()))))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.run_polling()
 
 if __name__ == "__main__":

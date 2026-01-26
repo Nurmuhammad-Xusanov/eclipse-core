@@ -1,7 +1,9 @@
+
 import os
 import re
 import asyncio
 import aiohttp
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import instaloader
@@ -33,11 +35,12 @@ IG_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "").strip()
 SESSION_FILE = Path("insta_session")
 
 # Telegram limits
-MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50MB for video
-MAX_PHOTO_SIZE = 10 * 1024 * 1024  # 10MB for photo
+MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_PHOTO_SIZE = 10 * 1024 * 1024  # 10MB
 
-# Download timeout
-DOWNLOAD_TIMEOUT = 120  # 2 minutes
+# Compress settings
+TARGET_VIDEO_SIZE = 45 * 1024 * 1024  # 45MB target (5MB xavfsizlik uchun)
+DOWNLOAD_TIMEOUT = 120
 
 # ================= INSTALOADER =================
 L = instaloader.Instaloader(
@@ -48,7 +51,7 @@ L = instaloader.Instaloader(
     compress_json=False,
     post_metadata_txt_pattern="",
     quiet=True,
-    sleep=False,  # Tezroq ishlashi uchun
+    sleep=False,
 )
 
 
@@ -85,6 +88,94 @@ def setup_session():
 
 
 setup_session()
+
+
+# ================= VIDEO COMPRESSION =================
+def check_ffmpeg():
+    """FFmpeg o'rnatilganligini tekshirish"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], 
+                      stdout=subprocess.PIPE, 
+                      stderr=subprocess.PIPE, 
+                      check=True)
+        return True
+    except:
+        return False
+
+
+async def compress_video(input_path: Path, output_path: Path, target_size: int):
+    """
+    Videoni compress qilish (low-end laptop uchun optimallashtirilgan)
+    
+    Strategy:
+    - 720p maksimum resolution
+    - CRF (Constant Rate Factor) usuli - tezroq va sifatliroq
+    - Hardware acceleration (agar mavjud bo'lsa)
+    """
+    try:
+        # Video ma'lumotlarini olish
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration,bit_rate',
+            '-of', 'default=noprint_wrappers=1',
+            str(input_path)
+        ]
+        
+        probe_result = await asyncio.create_subprocess_exec(
+            *probe_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, _ = await probe_result.communicate()
+        
+        # CRF usuli bilan compress (low-end uchun optimal)
+        # CRF 28 = yaxshi sifat va yengil fayl
+        compress_cmd = [
+            'ffmpeg', '-i', str(input_path),
+            '-c:v', 'libx264',  # H.264 codec
+            '-crf', '28',  # Quality (18=yuqori, 28=yaxshi, 32=past)
+            '-preset', 'veryfast',  # Low-end laptop uchun
+            '-vf', 'scale=-2:720',  # 720p max
+            '-c:a', 'aac',  # Audio codec
+            '-b:a', '128k',  # Audio bitrate
+            '-movflags', '+faststart',  # Web uchun optimizatsiya
+            '-y',  # Overwrite
+            str(output_path)
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *compress_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        await process.communicate()
+        
+        # Compress bo'lgan fayl hajmini tekshirish
+        if output_path.exists():
+            new_size = output_path.stat().st_size
+            if new_size <= target_size:
+                return True
+            else:
+                # Agar hali katta bo'lsa, CRF ni oshirish
+                compress_cmd[6] = '32'  # CRF 32
+                
+                process = await asyncio.create_subprocess_exec(
+                    *compress_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                await process.communicate()
+                return output_path.exists()
+        
+        return False
+        
+    except Exception as e:
+        print(f"Compress error: {e}")
+        return False
 
 
 # ================= ASYNC DOWNLOAD =================
@@ -129,7 +220,6 @@ async def download_post_media(post, tmp: Path):
             
             tasks.append(download_file_async(url, tmp / filename, session))
         
-        # Barcha fayllarni parallel yuklash
         await asyncio.gather(*tasks)
 
 
@@ -147,9 +237,10 @@ async def download_story_media(story, tmp: Path):
 
 
 # ================= PROCESS MEDIA =================
-def process_media(tmp: Path):
-    """Yuklab olingan medialarni qayta ishlash"""
+async def process_media(tmp: Path, status_callback=None):
+    """Yuklab olingan medialarni qayta ishlash va compress qilish"""
     media = []
+    has_ffmpeg = check_ffmpeg()
     
     for f in sorted(tmp.iterdir()):
         if not f.is_file():
@@ -160,18 +251,39 @@ def process_media(tmp: Path):
         
         if ext in (".mp4", ".mov"):
             # Video fayl
-            if size <= MAX_VIDEO_SIZE:
-                media.append({
-                    "path": str(f),
-                    "type": "video",
-                    "size": size
-                })
-            else:
-                # Katta videolar uchun ogohlantirish
+            if size > MAX_VIDEO_SIZE:
+                if has_ffmpeg:
+                    # Compress qilish
+                    if status_callback:
+                        await status_callback("🔄 Video compress qilinmoqda...")
+                    
+                    compressed_path = tmp / f"compressed_{f.name}"
+                    success = await compress_video(f, compressed_path, TARGET_VIDEO_SIZE)
+                    
+                    if success and compressed_path.exists():
+                        compressed_size = compressed_path.stat().st_size
+                        if compressed_size <= MAX_VIDEO_SIZE:
+                            media.append({
+                                "path": str(compressed_path),
+                                "type": "video",
+                                "size": compressed_size,
+                                "compressed": True
+                            })
+                            continue
+                
+                # Compress muvaffaqiyatsiz yoki FFmpeg yo'q
                 media.append({
                     "path": str(f),
                     "type": "too_large",
                     "size": size
+                })
+            else:
+                # Kichik video - compress kerak emas
+                media.append({
+                    "path": str(f),
+                    "type": "video",
+                    "size": size,
+                    "compressed": False
                 })
         
         elif ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -186,10 +298,15 @@ def process_media(tmp: Path):
     return media
 
 
-def clean_caption(text: str, max_length: int = 1024) -> str:
-    """Captionni tozalash va qisqartirish"""
+def clean_caption(text: str, max_length: int = 200) -> str:
+    """
+    Captionni tozalash va qisqartirish
+    - Hashtag va mentionlarni olib tashlash
+    - Emoji saqlab qolish
+    - Ko'p bo'sh joylarni tozalash
+    """
     if not text:
-        return ""
+        return "📥 Instagram"
     
     # Hashtag va mentionlarni olib tashlash
     text = re.sub(r'#\w+', '', text)
@@ -197,13 +314,18 @@ def clean_caption(text: str, max_length: int = 1024) -> str:
     
     # Ko'p bo'sh joylarni tozalash
     text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n', text)
     text = text.strip()
+    
+    # Bo'sh bo'lsa default caption
+    if not text or len(text) < 3:
+        return "📥 Instagram"
     
     # Uzunlikni cheklash
     if len(text) > max_length:
-        text = text[:max_length-3] + "..."
+        text = text[:max_length].rsplit(' ', 1)[0] + "..."
     
-    return text
+    return f"📥 {text}"
 
 
 # ================= SEND MEDIA =================
@@ -217,11 +339,19 @@ async def send_media(update: Update, media: list, caption: str):
     too_large = [m for m in media if m["type"] == "too_large"]
     if too_large:
         total_size = sum(m["size"] for m in too_large) / (1024 * 1024)
-        await update.message.reply_text(
-            f"⚠️ Video juda katta ({total_size:.1f} MB)\n"
-            f"Telegram 50 MB gacha videolarni qabul qiladi.\n"
-            f"Iltimos, Instagramdan to'g'ridan-to'g'ri yuklab oling."
-        )
+        
+        if not check_ffmpeg():
+            await update.message.reply_text(
+                f"⚠️ Video juda katta ({total_size:.1f} MB)\n\n"
+                f"❗️ FFmpeg o'rnatilmagan, compress qilib bo'lmadi.\n\n"
+                f"Server adminiga xabar bering:\n"
+                f"`sudo apt install ffmpeg -y`"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Video juda katta ({total_size:.1f} MB) va compress qilib bo'lmadi.\n"
+                f"Instagram'dan to'g'ridan-to'g'ri yuklab oling."
+            )
         return
     
     # Captionni tozalash
@@ -230,6 +360,12 @@ async def send_media(update: Update, media: list, caption: str):
     # Bitta fayl bo'lsa
     if len(media) == 1:
         item = media[0]
+        
+        # Compress info qo'shish
+        if item.get("compressed"):
+            original_size = item["size"] / (1024 * 1024)
+            clean_cap += f"\n\n🔄 Compressed: {original_size:.1f} MB"
+        
         try:
             with open(item["path"], "rb") as f:
                 if item["type"] == "video":
@@ -237,8 +373,8 @@ async def send_media(update: Update, media: list, caption: str):
                         video=f,
                         caption=clean_cap,
                         supports_streaming=True,
-                        read_timeout=60,
-                        write_timeout=60
+                        read_timeout=90,
+                        write_timeout=90
                     )
                 else:
                     await update.message.reply_photo(
@@ -270,8 +406,8 @@ async def send_media(update: Update, media: list, caption: str):
         if group:
             await update.message.reply_media_group(
                 media=group,
-                read_timeout=60,
-                write_timeout=60
+                read_timeout=90,
+                write_timeout=90
             )
     
     except Exception as e:
@@ -286,7 +422,7 @@ async def send_media(update: Update, media: list, caption: str):
 
 
 # ================= HANDLERS =================
-DOWNLOAD_SEM = asyncio.Semaphore(2)  # 2 ta parallel yuklab olish
+DOWNLOAD_SEM = asyncio.Semaphore(2)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,6 +446,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with DOWNLOAD_SEM:
         status_msg = await update.message.reply_text("⏳ Yuklanmoqda...")
         
+        async def update_status(text):
+            try:
+                await status_msg.edit_text(text)
+            except:
+                pass
+        
         tmpdir = TemporaryDirectory(prefix="ig_")
         tmp = Path(tmpdir.name)
         
@@ -317,6 +459,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if post_match:
                 # Post yoki Reel
                 shortcode = post_match.group(1)
+                
+                await update_status("📥 Instagram'dan yuklanmoqda...")
                 
                 # Postni olish
                 post = await asyncio.to_thread(
@@ -334,6 +478,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif story_match:
                 # Story
                 username = story_match.group(1)
+                
+                await update_status("📥 Story yuklanmoqda...")
                 
                 # Story olish
                 profile = await asyncio.to_thread(
@@ -360,17 +506,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await download_story_media(story, tmp)
                 caption = ""
             
-            # Medialarni qayta ishlash
-            media = process_media(tmp)
+            # Medialarni qayta ishlash va compress qilish
+            media = await process_media(tmp, update_status)
             
+            await update_status("📤 Telegram'ga yuborilmoqda...")
             await status_msg.delete()
             await send_media(update, media, caption)
         
         except instaloader.exceptions.LoginRequiredException:
-            await status_msg.edit_text("❌ Instagram login talab qiladi. .env faylida LOGIN va PASSWORD qo'shing")
+            await status_msg.edit_text(
+                "❌ Instagram login talab qiladi\n\n"
+                ".env faylida LOGIN va PASSWORD qo'shing"
+            )
         
         except instaloader.exceptions.PrivateProfileNotFollowedException:
-            await status_msg.edit_text("❌ Bu profil yopiq. Botdan foydalanish uchun follow qiling")
+            await status_msg.edit_text("❌ Bu profil yopiq")
         
         except instaloader.exceptions.QueryReturnedNotFoundException:
             await status_msg.edit_text("❌ Post topilmadi yoki o'chirilgan")
@@ -381,7 +531,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "rate limit" in error_msg.lower():
-                await status_msg.edit_text("❌ Instagram chekladi. Bir oz kutib qayta urinib ko'ring")
+                await status_msg.edit_text("❌ Instagram chekladi. 10 daqiqa kutib qayta urinib ko'ring")
             else:
                 await status_msg.edit_text(f"❌ Xato: {error_msg[:150]}")
         
@@ -391,15 +541,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start komandasi"""
+    ffmpeg_status = "✅ O'rnatilgan" if check_ffmpeg() else "❌ O'rnatilmagan"
+    
     await update.message.reply_text(
-        "👋 Salom!\n\n"
-        "Instagram post, reel yoki story linkini yuboring.\n\n"
-        "📌 Qo'llab-quvvatlanadigan formatlar:\n"
-        "• Post (bir yoki ko'p surat/video)\n"
-        "• Reel\n"
-        "• Story\n"
-        "• IGTV\n\n"
-        "💡 Maslahat: Link to'liq bo'lishi shart emas, qisqa link ham ishlaydi"
+        f"👋 Salom!\n\n"
+        f"Instagram post, reel yoki story linkini yuboring.\n\n"
+        f"📌 Imkoniyatlar:\n"
+        f"• Post va carousel\n"
+        f"• Reel (50MB+ avtomatik compress)\n"
+        f"• Story\n"
+        f"• Toza caption (hashtag/mention siz)\n\n"
+        f"🔧 FFmpeg: {ffmpeg_status}\n\n"
+        f"💡 50MB+ videolar avtomatik compress qilinadi"
     )
 
 
@@ -411,6 +564,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     
     print("🤖 Bot ishga tushdi...")
+    print(f"🔧 FFmpeg: {'✅ Mavjud' if check_ffmpeg() else '❌ O\'rnatilmagan'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

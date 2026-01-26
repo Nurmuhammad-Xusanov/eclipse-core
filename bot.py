@@ -2,11 +2,8 @@ import os
 import re
 import asyncio
 import requests
-import shutil
-import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
-
 import instaloader
 from dotenv import load_dotenv
 
@@ -15,7 +12,7 @@ try:
 except ImportError:
     browser_cookie3 = None
 
-from telegram import Update, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,7 +32,9 @@ IG_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "").strip()
 
 SESSION_FILE = Path("insta_session")
 
-MAX_TELEGRAM_SIZE = 48 * 1024 * 1024
+# Telegram bot uchun real chegaralar (2025 holati)
+MAX_VIDEO_SIZE = 50 * 1024 * 1024       # send_video uchun taxminan
+MAX_DOCUMENT_SIZE = 2000 * 1024 * 1024  # send_document uchun (premium bo'lmasa ham ~2GB)
 
 # ================= INSTALOADER =================
 L = instaloader.Instaloader(
@@ -58,7 +57,7 @@ def setup_session():
             L.load_session_from_file(IG_USERNAME, str(SESSION_FILE))
             if L.test_login() == IG_USERNAME:
                 return
-        except:
+        except Exception:
             SESSION_FILE.unlink(missing_ok=True)
 
     if IG_USERNAME and IG_PASSWORD:
@@ -66,7 +65,7 @@ def setup_session():
             L.login(IG_USERNAME, IG_PASSWORD)
             L.save_session_to_file(str(SESSION_FILE))
             return
-        except:
+        except Exception:
             pass
 
     if browser_cookie3:
@@ -77,37 +76,25 @@ def setup_session():
                 if L.test_login():
                     L.save_session_to_file(str(SESSION_FILE))
                     return
-            except:
+            except Exception:
                 pass
 
+
 setup_session()
-
-# ================= FAST REMUX (0 CPU) =================
-def fast_remux(input_path: Path, output_path: Path) -> bool:
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(output_path)
-    ]
-    try:
-        subprocess.run(cmd, check=True, timeout=120, capture_output=True)
-        return output_path.stat().st_size <= MAX_TELEGRAM_SIZE
-    except:
-        output_path.unlink(missing_ok=True)
-        return False
-
 
 # ================= MANUAL DOWNLOAD =================
 def download_carousel_manually(post, tmp: Path):
     def save(url, name):
-        r = requests.get(url, stream=True, timeout=30)
-        if r.status_code == 200:
-            p = tmp / name
-            with open(p, "wb") as f:
-                for c in r.iter_content(32768):
-                    f.write(c)
+        try:
+            r = requests.get(url, stream=True, timeout=25)
+            if r.status_code == 200:
+                p = tmp / name
+                with open(p, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+        except Exception:
+            pass
 
     if post.mediacount > 1:
         for i, node in enumerate(post.get_sidecar_nodes(), 1):
@@ -134,27 +121,22 @@ def process_media(tmp: Path):
         suf = f.suffix.lower()
 
         if suf in (".mp4", ".mov"):
-            if size <= MAX_TELEGRAM_SIZE:
-                media.append({
-                    "path": str(f),
-                    "type": "video",
-                    "send_as": "video"
-                })
+            item = {
+                "path": str(f),
+                "type": "video",
+                "size": size
+            }
+
+            if size <= MAX_VIDEO_SIZE:
+                item["send_as"] = "video"
             else:
-                remuxed = f.with_name(f.stem + "_fast.mp4")
-                if fast_remux(f, remuxed):
-                    f.unlink(missing_ok=True)
-                    media.append({
-                        "path": str(remuxed),
-                        "type": "video",
-                        "send_as": "video"
-                    })
-                else:
-                    media.append({
-                        "path": str(f),
-                        "type": "video",
-                        "send_as": "document"
-                    })
+                item["send_as"] = "document"
+
+            # Juda katta bo'lsa ham yuborishga urinamiz (document bilan)
+            if size > MAX_DOCUMENT_SIZE:
+                item["send_as"] = "too_big"
+
+            media.append(item)
 
         elif suf in (".jpg", ".jpeg", ".png", ".webp"):
             media.append({
@@ -166,81 +148,140 @@ def process_media(tmp: Path):
     return media
 
 
-# ================= CLEAN CAPTION =================
-def clean_caption(_):
-    return "📥 Instagram"
-
-
 # ================= SEND =================
-async def send_media(update: Update, media, caption):
+async def send_media(update: Update, media, caption: str):
     if not media:
-        await update.message.reply_text("❌ Media yo‘q")
+        await update.message.reply_text("❌ Hech qanday media topilmadi")
+        return
+
+    # Juda katta fayl borligini tekshirish
+    too_big = any(m.get("send_as") == "too_big" for m in media)
+    if too_big:
+        await update.message.reply_text(
+            "⚠️ Video(lar) juda katta (2 GB dan ortiq).\n"
+            "Instagramdan o'zingiz yuklab oling yoki boshqa havola yuboring."
+        )
         return
 
     if len(media) == 1:
         item = media[0]
-        with open(item["path"], "rb") as f:
-            if item["send_as"] == "document":
-                await update.message.reply_document(f, caption=caption)
-            elif item["type"] == "video":
-                await update.message.reply_video(f, caption=caption, supports_streaming=True)
-            else:
-                await update.message.reply_photo(f, caption=caption)
+        try:
+            with open(item["path"], "rb") as f:
+                if item["send_as"] == "document":
+                    await update.message.reply_document(
+                        document=f,
+                        caption=caption,
+                        disable_notification=True
+                    )
+                elif item["send_as"] == "video":
+                    await update.message.reply_video(
+                        video=f,
+                        caption=caption,
+                        supports_streaming=True,
+                        disable_notification=True
+                    )
+                else:
+                    await update.message.reply_photo(
+                        photo=f,
+                        caption=caption,
+                        disable_notification=True
+                    )
+        except Exception as e:
+            await update.message.reply_text(f"Yuborishda xato: {str(e)}")
         return
 
+    # Media group (10 tagacha)
     group = []
-    files = []
-    for i, item in enumerate(media[:10]):
-        fd = open(item["path"], "rb")
-        files.append(fd)
-        cap = caption if i == 0 else None
-        if item["type"] == "video":
-            group.append(InputMediaVideo(fd, caption=cap))
-        else:
-            group.append(InputMediaPhoto(fd, caption=cap))
+    open_files = []
 
-    await update.message.reply_media_group(group)
+    try:
+        for i, item in enumerate(media[:10]):
+            fd = open(item["path"], "rb")
+            open_files.append(fd)
+            cap = caption if i == 0 else ""
 
-    for f in files:
-        f.close()
+            if item["send_as"] == "document":
+                group.append(InputMediaDocument(media=fd, caption=cap))
+            elif item["send_as"] == "video":
+                group.append(InputMediaVideo(media=fd, caption=cap))
+            else:
+                group.append(InputMediaPhoto(media=fd, caption=cap))
+
+        if group:
+            await update.message.reply_media_group(
+                media=group,
+                disable_notification=True
+            )
+    except Exception as e:
+        await update.message.reply_text(f"Media group yuborishda xato: {str(e)}")
+    finally:
+        for f in open_files:
+            try:
+                f.close()
+            except:
+                pass
 
 
 # ================= HANDLER =================
 DOWNLOAD_SEM = asyncio.Semaphore(1)
 
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    m = re.search(r"(?:/p/|/reel/|/tv/)([A-Za-z0-9_-]+)", text)
+    m = re.search(r"(?:/p/|/reel/|/tv/|/stories/)([A-Za-z0-9_-]+)", text)
     if not m:
-        await update.message.reply_text("Instagram link yubor")
+        await update.message.reply_text("Instagram post/reel/story linkini yuboring")
         return
 
     shortcode = m.group(1)
 
     async with DOWNLOAD_SEM:
-        status = await update.message.reply_text("⏳ Yuklanmoqda...")
+        status_msg = await update.message.reply_text("⏳ Yuklanmoqda... (20-40 soniya)")
         tmpdir = TemporaryDirectory(prefix="ig_")
         tmp = Path(tmpdir.name)
 
         try:
-            post = await asyncio.to_thread(instaloader.Post.from_shortcode, L.context, shortcode)
-            download_carousel_manually(post, tmp)
+            # Post, reel yoki IGTV
+            if "/stories/" not in text:
+                post = await asyncio.to_thread(
+                    instaloader.Post.from_shortcode,
+                    L.context,
+                    shortcode
+                )
+                download_carousel_manually(post, tmp)
+                caption = post.caption or "Instagram"
+            else:
+                # Story uchun alohida logika kerak (hozircha oddiy post sifatida)
+                await update.message.reply_text("Story yuklash hali to'liq qo'llab-quvvatlanmaydi")
+                return
+
             media = process_media(tmp)
-            await status.delete()
-            await send_media(update, media, clean_caption(post.caption))
+            await status_msg.delete()
+            await send_media(update, media, caption)
+
+        except instaloader.exceptions.LoginRequiredException:
+            await status_msg.edit_text("Instagram login talab qilindi. Bot egasiga xabar bering.")
+        except instaloader.exceptions.PrivateProfileNotFollowedException:
+            await status_msg.edit_text("Bu profil yopiq. Bot uni ko'ra olmaydi.")
+        except Exception as e:
+            await status_msg.edit_text(f"Xato yuz berdi: {str(e)[:200]}")
         finally:
             tmpdir.cleanup()
 
 
-# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Instagram link yubor")
+    await update.message.reply_text(
+        "Salom! Instagram post, reel yoki carousel linkini yuboring.\n"
+        "Misol: https://www.instagram.com/reel/ABC123xyz/"
+    )
+
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()

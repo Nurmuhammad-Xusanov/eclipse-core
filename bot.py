@@ -1,4 +1,3 @@
-
 import os
 import re
 import asyncio
@@ -431,7 +430,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Link formatini tekshirish
     post_match = re.search(r"(?:/p/|/reel/|/tv/)([A-Za-z0-9_-]+)", text)
-    story_match = re.search(r"/stories/([^/]+)/(\d+)", text)
+    story_match = re.search(r"/stories/([A-Za-z0-9._]+)/(\d+)", text)
+    
+    # Agar oddiy story link bo'lsa (username/story_id)
+    if not story_match:
+        story_match = re.search(r"instagram\.com/([A-Za-z0-9._]+).*?story", text, re.IGNORECASE)
     
     if not post_match and not story_match:
         await update.message.reply_text(
@@ -478,33 +481,62 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif story_match:
                 # Story
                 username = story_match.group(1)
+                story_id = story_match.group(2)
                 
                 await update_status("📥 Story yuklanmoqda...")
                 
-                # Story olish
-                profile = await asyncio.to_thread(
-                    instaloader.Profile.from_username,
-                    L.context,
-                    username
-                )
-                
-                # Eng so'nggi storyni olish
-                stories = L.get_stories([profile.userid])
-                story = None
-                
-                for user_story in stories:
-                    for item in user_story.get_items():
-                        story = item
-                        break
-                    if story:
-                        break
-                
-                if not story:
-                    await status_msg.edit_text("❌ Story topilmadi yoki muddati tugagan")
+                try:
+                    # Profile olish
+                    profile = await asyncio.to_thread(
+                        instaloader.Profile.from_username,
+                        L.context,
+                        username
+                    )
+                    
+                    # Barcha storylarni olish
+                    stories = await asyncio.to_thread(
+                        lambda: list(L.get_stories([profile.userid]))
+                    )
+                    
+                    story_item = None
+                    
+                    # Story ID bo'yicha qidirish
+                    for user_story in stories:
+                        for item in user_story.get_items():
+                            if str(item.mediaid) == story_id or story_id in str(item):
+                                story_item = item
+                                break
+                        if story_item:
+                            break
+                    
+                    # Agar ID topilmasa, eng yangi storyni olish
+                    if not story_item and stories:
+                        for user_story in stories:
+                            items = list(user_story.get_items())
+                            if items:
+                                story_item = items[0]
+                                break
+                    
+                    if not story_item:
+                        await status_msg.edit_text(
+                            "❌ Story topilmadi\n\n"
+                            "Sabablari:\n"
+                            "• Story muddati tugagan (24 soat)\n"
+                            "• Profil yopiq va siz follow qilmagansiz\n"
+                            "• Instagram login kerak"
+                        )
+                        return
+                    
+                    await download_story_media(story_item, tmp)
+                    caption = ""
+                    
+                except Exception as e:
+                    await status_msg.edit_text(
+                        f"❌ Story yuklanmadi\n\n"
+                        f"Story uchun Instagram login talab qilinishi mumkin.\n"
+                        f".env faylida INSTAGRAM_USERNAME va INSTAGRAM_PASSWORD qo'shing"
+                    )
                     return
-                
-                await download_story_media(story, tmp)
-                caption = ""
             
             # Medialarni qayta ishlash va compress qilish
             media = await process_media(tmp, update_status)

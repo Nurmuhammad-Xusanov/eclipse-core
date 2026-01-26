@@ -1,20 +1,23 @@
 import os
 import re
-import uuid
-import shutil
-import asyncio
 import json
+import asyncio
+import requests
+import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import instaloader
 from dotenv import load_dotenv
 
-from telegram import (
-    Update,
-    InputMediaPhoto,
-    InputMediaVideo,
-)
+try:
+    import browser_cookie3
+except ImportError:
+    browser_cookie3 = None
+
+from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,23 +25,22 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import NetworkError, BadRequest
 
-# ================= ENV =================
+# ================= CONFIG =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN yo‘q")
+    raise RuntimeError("BOT_TOKEN missing in .env")
 
-IG_USER = os.getenv("INSTAGRAM_USERNAME", "")
-IG_PASS = os.getenv("INSTAGRAM_PASSWORD", "")
+IG_USERNAME = os.getenv("INSTAGRAM_USERNAME", "").strip()
+IG_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "").strip()
 
-# ================= PATHS =================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SESSION_FILE = os.path.join(BASE_DIR, "insta_session")
-STATS_FILE = "stats.json"
+SESSION_FILE = Path("insta_session")
+STATS_FILE = Path("stats.json")
 
-# ================= GLOBALS =================
-ACTIVE_USERS = set()
+MAX_TELEGRAM_SIZE = 48 * 1024 * 1024
+COMPRESSED_SUFFIX = "_compressed.mp4"
 
 # ================= INSTALOADER =================
 L = instaloader.Instaloader(
@@ -48,173 +50,379 @@ L = instaloader.Instaloader(
     save_metadata=False,
     compress_json=False,
     post_metadata_txt_pattern="",
-    quiet=True,
+    quiet=False,
+    sleep=True,
+    max_connection_attempts=5,
+    request_timeout=35,
 )
 
 L.context.raise_all_errors = True
 
-def ig_login():
+def setup_session():
+    if IG_USERNAME and SESSION_FILE.exists():
+        try:
+            L.load_session_from_file(IG_USERNAME, str(SESSION_FILE))
+            if L.test_login() == IG_USERNAME:
+                print(f"✅ Loaded session for {IG_USERNAME}")
+                return True
+            SESSION_FILE.unlink(missing_ok=True)
+        except:
+            SESSION_FILE.unlink(missing_ok=True)
+
+    if IG_USERNAME and IG_PASSWORD:
+        try:
+            L.login(IG_USERNAME, IG_PASSWORD)
+            L.save_session_to_file(str(SESSION_FILE))
+            print("✅ Password login OK")
+            return True
+        except:
+            pass
+
+    if browser_cookie3:
+        for fn in [browser_cookie3.firefox, browser_cookie3.chrome]:
+            try:
+                cj = fn(domain_name="instagram.com")
+                L.context._session.cookies.update(cj)
+                if IG_USERNAME:
+                    L.context.username = IG_USERNAME
+                if L.test_login():
+                    L.save_session_to_file(str(SESSION_FILE))
+                    print("✅ Browser cookies OK")
+                    return True
+            except:
+                pass
+
+    print("⚠️ Anonymous mode")
+    return False
+
+setup_session()
+
+
+# ================= COMPRESS VIDEO =================
+def compress_video(input_path: Path, output_path: Path) -> bool:
+    """Video kompressiya qiladi va muvaffaqiyatli bo'lsa True qaytaradi"""
+    
+    # CRF 24 → yaxshi sifat
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vcodec", "libx264", "-crf", "24", "-preset", "medium",
+        "-acodec", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ]
     try:
-        if IG_USER and os.path.exists(SESSION_FILE):
-            L.load_session_from_file(IG_USER, SESSION_FILE)
-            print("✅ IG session loaded")
-            return
-
-        if IG_USER and IG_PASS:
-            L.login(IG_USER, IG_PASS)
-            L.save_session_to_file(SESSION_FILE)
-            print("✅ IG logged in")
-            return
-
-        print("⚠️ IG login yo‘q — faqat public")
+        subprocess.run(cmd, check=True, timeout=400, capture_output=True)
+        if output_path.stat().st_size <= MAX_TELEGRAM_SIZE:
+            print(f"✅ Compressed: {output_path.name} ({output_path.stat().st_size//(1024*1024)} MB)")
+            return True
     except Exception as e:
-        print("⚠️ IG login error:", e)
+        print(f"CRF 24 failed: {e}")
+        output_path.unlink(missing_ok=True)
 
-ig_login()
-
-# ================= STATS =================
-def load_stats():
-    if not os.path.exists(STATS_FILE):
-        return {"total": 0, "today": 0, "date": str(date.today())}
-    with open(STATS_FILE, "r") as f:
-        return json.load(f)
-
-def save_stats(s):
-    with open(STATS_FILE, "w") as f:
-        json.dump(s, f)
-
-def inc_stats():
-    s = load_stats()
-    if s["date"] != str(date.today()):
-        s["date"] = str(date.today())
-        s["today"] = 0
-    s["today"] += 1
-    s["total"] += 1
-    save_stats(s)
-
-# ================= HELPERS =================
-def safe_cleanup(p):
-    shutil.rmtree(p, ignore_errors=True)
-
-async def safe_edit(msg, text):
+    # Agar hali katta bo'lsa → 480p + past bitrate
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", "scale=854:480",
+        "-vcodec", "libx264", "-crf", "28", "-b:v", "800k",
+        "-acodec", "aac", "-b:a", "96k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ]
     try:
-        await msg.edit_text(text)
-    except:
-        pass
+        subprocess.run(cmd, check=True, timeout=400, capture_output=True)
+        if output_path.stat().st_size <= MAX_TELEGRAM_SIZE:
+            print(f"✅ Compressed 480p: {output_path.name} ({output_path.stat().st_size//(1024*1024)} MB)")
+            return True
+    except Exception as e:
+        print(f"480p compression failed: {e}")
 
-def is_instagram(url):
-    return "instagram.com" in url
+    output_path.unlink(missing_ok=True)
+    return False
 
-def extract_shortcode(url):
-    m = re.search(r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
-    return m.group(1) if m else None
 
-def clean_caption(text):
-    if not text:
-        return "📥 Instagram"
-    text = re.sub(r"#\w+", "", text).strip()
-    return text[:1000] or "📥 Instagram"
+# ================= MANUAL CAROUSEL YUKLASH =================
+def download_carousel_manually(post, temp_path: Path) -> list[dict]:
+    """Carousel postlarni manual ravishda yuklab oladi"""
+    saved = []
+    
+    def save_url(url: str, fname: str, media_type: str):
+        try:
+            r = requests.get(url, timeout=30, stream=True)
+            if r.status_code == 200:
+                path = temp_path / fname
+                with path.open("wb") as f:
+                    for chunk in r.iter_content(32768):
+                        f.write(chunk)
+                size = path.stat().st_size
+                size_mb = size / (1024 * 1024)
+                print(f"📥 Saved: {fname} ({size_mb:.1f} MB)")
+                saved.append({
+                    "path": str(path),
+                    "type": media_type,
+                    "size": size,
+                    "original": True
+                })
+                return True
+        except Exception as e:
+            print(f"❌ Save failed {fname}: {e}")
+        return False
 
-def get_media_files(directory):
+    try:
+        # Carousel mavjudligini tekshirish
+        if post.mediacount > 1:
+            print(f"🎠 Carousel detected: {post.mediacount} items")
+            
+            # get_sidecar_nodes() ishlatish
+            try:
+                nodes = list(post.get_sidecar_nodes())
+                print(f"Found {len(nodes)} sidecar nodes")
+                
+                for idx, node in enumerate(nodes, 1):
+                    if node.is_video and node.video_url:
+                        save_url(node.video_url, f"carousel_{idx:02d}.mp4", "video")
+                    elif node.display_url:
+                        save_url(node.display_url, f"carousel_{idx:02d}.jpg", "photo")
+                        
+            except Exception as e:
+                print(f"⚠️ get_sidecar_nodes() failed: {e}")
+                
+                # Alternativ: edge_sidecar_to_children ishlatish
+                try:
+                    if hasattr(post, '_node') and 'edge_sidecar_to_children' in post._node:
+                        edges = post._node['edge_sidecar_to_children']['edges']
+                        print(f"Found {len(edges)} edges in _node")
+                        
+                        for idx, edge in enumerate(edges, 1):
+                            node = edge['node']
+                            if node.get('is_video') and node.get('video_url'):
+                                save_url(node['video_url'], f"carousel_{idx:02d}.mp4", "video")
+                            elif node.get('display_url'):
+                                save_url(node['display_url'], f"carousel_{idx:02d}.jpg", "photo")
+                except Exception as e2:
+                    print(f"⚠️ Manual edge parsing failed: {e2}")
+        
+        # Bitta media bo'lsa
+        else:
+            if post.is_video and post.video_url:
+                save_url(post.video_url, "main_video.mp4", "video")
+            elif post.url:
+                save_url(post.url, "main_photo.jpg", "photo")
+                
+    except Exception as e:
+        print(f"❌ Manual download error: {e}")
+    
+    return saved
+
+
+# ================= MEDIA TO'PLASH + COMPRESS =================
+def process_media(temp_path: Path) -> list[dict]:
+    """Barcha medialarni to'playdi va video kompressiya qiladi"""
     media = []
-    for f in Path(directory).rglob("*"):
-        if f.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png", ".webp"):
+    processed_files = set()
+    
+    for file in sorted(temp_path.rglob("*")):
+        if not file.is_file() or file.name in processed_files:
+            continue
+            
+        # Compressed fayllarni o'tkazib yuborish
+        if COMPRESSED_SUFFIX in file.name:
+            continue
+            
+        suf = file.suffix.lower()
+        size = file.stat().st_size
+        
+        if suf in {".mp4", ".mov"}:
+            # Video kompressiya kerakmi?
+            if size > MAX_TELEGRAM_SIZE:
+                print(f"🔄 Compressing large video: {file.name} ({size//(1024*1024)} MB)")
+                compressed_path = file.parent / f"{file.stem}_compressed{file.suffix}"
+                
+                if compress_video(file, compressed_path):
+                    # Original faylni o'chirish
+                    file.unlink()
+                    processed_files.add(file.name)
+                    
+                    media.append({
+                        "path": str(compressed_path),
+                        "type": "video",
+                        "size": compressed_path.stat().st_size
+                    })
+                    processed_files.add(compressed_path.name)
+                else:
+                    print(f"⚠️ Skipping {file.name} - compression failed")
+            else:
+                media.append({
+                    "path": str(file),
+                    "type": "video",
+                    "size": size
+                })
+                processed_files.add(file.name)
+                
+        elif suf in {".jpg", ".jpeg", ".png", ".webp"}:
             media.append({
-                "path": str(f),
-                "type": "video" if f.suffix.lower() == ".mp4" else "photo"
+                "path": str(file),
+                "type": "photo",
+                "size": size
             })
+            processed_files.add(file.name)
+    
     return sorted(media, key=lambda x: x["path"])
 
-# ================= DOWNLOAD =================
-def download_post(shortcode, temp_dir):
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    L.download_post(post, target=temp_dir)
-    return post.caption or ""
+
+# ================= CAPTION TOZALASH =================
+def clean_caption(text: str) -> str:
+    """Caption dan keraksiz belgilarni olib tashlaydi"""
+    if not text:
+        return ""
+    # Hashtag va mention qoldirish, boshqa formatlash
+    text = text.strip()
+    # 1024 belgidan uzun bo'lsa kesish (Telegram limit)
+    if len(text) > 1024:
+        text = text[:1020] + "..."
+    return text
+
 
 # ================= SEND =================
-async def send_media(update, media, caption):
-    if len(media) == 1:
-        with open(media[0]["path"], "rb") as f:
-            if media[0]["type"] == "video":
-                await update.message.reply_video(video=f, caption=caption)
-            else:
-                await update.message.reply_photo(photo=f, caption=caption)
+async def send_media(update: Update, media: list[dict], caption: str):
+    if not media:
+        await update.message.reply_text("❌ Hech qanday media yuklanmadi")
         return
 
+    # Bitta media
+    if len(media) == 1:
+        item = media[0]
+        if item["size"] > MAX_TELEGRAM_SIZE:
+            await update.message.reply_text(f"❌ Fayl juda katta ({item['size']//(1024*1024)} MB)")
+            return
+        with open(item["path"], "rb") as f:
+            try:
+                if item["type"] == "video":
+                    await update.message.reply_video(f, caption=caption, supports_streaming=True)
+                else:
+                    await update.message.reply_photo(f, caption=caption)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Yuborishda xato: {str(e)[:100]}")
+        return
+
+    # Media group (max 10 ta)
     group = []
     files = []
-    for i, m in enumerate(media[:10]):
-        f = open(m["path"], "rb")
-        files.append(f)
-        if m["type"] == "video":
-            group.append(InputMediaVideo(f, caption=caption if i == 0 else None))
-        else:
-            group.append(InputMediaPhoto(f, caption=caption if i == 0 else None))
-
-    await update.message.reply_media_group(group)
-
-    for f in files:
-        f.close()
-
-# ================= CORE =================
-async def handle_instagram(update):
-    url = update.message.text.strip()
-    temp_dir = f"ig_{uuid.uuid4().hex}"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    status = await update.message.reply_text("⏳ Yuklanmoqda...")
-
     try:
-        shortcode = extract_shortcode(url)
-        if not shortcode:
-            await safe_edit(status, "❌ Noto‘g‘ri Instagram link")
-            return
-
-        caption = await asyncio.to_thread(download_post, shortcode, temp_dir)
-
-        media = get_media_files(temp_dir)
-        if not media:
-            await safe_edit(status, "❌ Media topilmadi")
-            return
-
-        await status.delete()
-        await send_media(update, media, clean_caption(caption))
-        inc_stats()
-
-    except json.JSONDecodeError:
-        await safe_edit(status, "❌ Instagram vaqtincha javob bermadi")
+        extra = f"\n\n⚠️ Jami {len(media)} ta media (10 ta ko'rsatildi)" if len(media) > 10 else ""
+        
+        for i, item in enumerate(media[:10]):
+            fd = open(item["path"], "rb")
+            files.append(fd)
+            
+            cap = (caption + extra) if i == 0 else None
+            
+            if item["type"] == "video":
+                group.append(InputMediaVideo(fd, caption=cap, supports_streaming=True))
+            else:
+                group.append(InputMediaPhoto(fd, caption=cap))
+        
+        if group:
+            await update.message.reply_media_group(group)
+            print(f"✅ Sent {len(group)} media items")
+            
     except Exception as e:
-        await safe_edit(status, f"❌ Xato: {str(e)[:120]}")
+        await update.message.reply_text(f"❌ Media group yuborishda xato: {str(e)[:100]}")
     finally:
-        safe_cleanup(temp_dir)
+        # Barcha ochiq fayllarni yopish
+        for f in files:
+            try:
+                f.close()
+            except:
+                pass
 
-# ================= MESSAGE =================
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid in ACTIVE_USERS:
-        await update.message.reply_text("⏳ Kut...")
+
+# ================= ASOSIY HANDLER =================
+DOWNLOAD_SEM = asyncio.Semaphore(1)
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    shortcode = re.search(r"(?:/p/|/reel/|/tv/)([A-Za-z0-9_-]{10,})", text)
+    shortcode = shortcode.group(1) if shortcode else None
+
+    if not shortcode:
+        await update.message.reply_text("📎 Instagram post/reel link yuboring")
         return
 
-    ACTIVE_USERS.add(cid)
-    try:
-        if is_instagram(update.message.text):
-            await handle_instagram(update)
-        else:
-            await update.message.reply_text("❌ Faqat Instagram link")
-    finally:
-        ACTIVE_USERS.discard(cid)
+    async with DOWNLOAD_SEM:
+        status = await update.message.reply_text(f"⏳ Yuklanmoqda... ({shortcode})")
 
-# ================= MAIN =================
+        temp_dir_obj = TemporaryDirectory(prefix="ig_")
+        tmp = Path(temp_dir_obj.name)
+        
+        print(f"\n{'='*50}")
+        print(f"📥 Processing: {shortcode}")
+        print(f"📁 Temp dir: {tmp}")
+
+        try:
+            # Post ma'lumotlarini olish
+            post = await asyncio.to_thread(instaloader.Post.from_shortcode, L.context, shortcode)
+            print(f"📊 Post info: mediacount={post.mediacount}, is_video={post.is_video}")
+
+            # Manual yuklash (carousel uchun eng ishonchli)
+            media_list = download_carousel_manually(post, tmp)
+            
+            # Media qayta ishlash (compress va tozalash)
+            media = process_media(tmp)
+            
+            print(f"✅ Processed {len(media)} media files")
+
+            await status.delete()
+
+            if not media:
+                await update.message.reply_text("❌ Media topilmadi yoki yuklanmadi")
+                return
+
+            cap = clean_caption(post.caption or "")
+            await send_media(update, media, cap)
+
+        except Exception as e:
+            err = str(e)[:140]
+            print(f"❌ Error {shortcode}: {err}")
+            try:
+                await status.edit_text(f"❌ Xato: {err}")
+            except:
+                await update.message.reply_text(f"❌ Xato: {err}")
+                
+        finally:
+            # MAJBURIY TOZALASH
+            try:
+                temp_dir_obj.cleanup()
+            except Exception as e:
+                print(f"⚠️ Cleanup warning: {e}")
+                
+            # Qo'shimcha tozalash (agar cleanup() ishlamasa)
+            if tmp.exists():
+                try:
+                    shutil.rmtree(str(tmp), ignore_errors=True)
+                except:
+                    pass
+                    
+            print(f"🧹 Cleaned: {tmp}")
+            print(f"{'='*50}\n")
+
+
+# ================= COMMANDS =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Salom! Instagram link yuboring → yuklab beraman\n\n"
+        "✅ Reel, post, carousel\n"
+        "✅ Video va rasmlar\n"
+        "✅ Avtomatik kompressiya"
+    )
+
+
 def main():
-    print("🤖 Eclipse Core ONLINE")
-
+    print("🤖 Bot ishga tushdi")
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.run_polling(drop_pending_updates=True)
 
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("📥 Instagram downloader")))
-    app.add_handler(CommandHandler("stats", lambda u, c: u.message.reply_text(str(load_stats()))))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    app.run_polling()
 
 if __name__ == "__main__":
     main()

@@ -336,16 +336,136 @@ async def send_media(update: Update, media: list[dict], caption: str):
                 pass
 
 
+# ================= STORY YUKLASH =================
+async def download_story(update: Update, username: str, story_id: str = None):
+    """Instagram Story yuklab oladi"""
+    status = await update.message.reply_text(f"⏳ Story yuklanmoqda: @{username}...")
+    
+    temp_dir_obj = TemporaryDirectory(prefix="ig_story_")
+    tmp = Path(temp_dir_obj.name)
+    
+    print(f"\n{'='*50}")
+    print(f"📖 Story: @{username} (ID: {story_id})")
+    print(f"📁 Temp dir: {tmp}")
+    
+    try:
+        # Profile olish
+        profile = await asyncio.to_thread(instaloader.Profile.from_username, L.context, username)
+        
+        stories = []
+        story_count = 0
+        
+        # Barcha storylarni olish (blocking funksiya)
+        def fetch_stories():
+            nonlocal story_count
+            try:
+                for story in L.get_stories(userids=[profile.userid]):
+                    for item in story.get_items():
+                        story_count += 1
+                        
+                        # Agar ma'lum ID berilgan bo'lsa, faqat uni olish
+                        if story_id and str(item.mediaid) != story_id:
+                            continue
+                        
+                        url = item.video_url if item.is_video else item.url
+                        ext = ".mp4" if item.is_video else ".jpg"
+                        fname = f"story_{item.mediaid}{ext}"
+                        
+                        # Yuklash
+                        try:
+                            r = requests.get(url, timeout=30, stream=True)
+                            if r.status_code == 200:
+                                path = tmp / fname
+                                with path.open("wb") as f:
+                                    for chunk in r.iter_content(32768):
+                                        f.write(chunk)
+                                
+                                stories.append({
+                                    "path": str(path),
+                                    "type": "video" if item.is_video else "photo",
+                                    "size": path.stat().st_size
+                                })
+                                print(f"✅ Story saved: {fname}")
+                        except Exception as e:
+                            print(f"❌ Story download failed: {e}")
+            except Exception as e:
+                print(f"❌ get_stories error: {e}")
+        
+        await asyncio.to_thread(fetch_stories)
+        
+        if not stories:
+            await status.edit_text(f"❌ @{username} da aktiv story topilmadi")
+            return
+        
+        # Media qayta ishlash
+        media = process_media(tmp)
+        
+        await status.delete()
+        
+        if media:
+            cap = f"📖 Story: @{username}"
+            await send_media(update, media, cap)
+        else:
+            await update.message.reply_text("❌ Story yuklanmadi")
+            
+    except instaloader.exceptions.ProfileNotExistsException:
+        await status.edit_text(f"❌ @{username} topilmadi")
+    except instaloader.exceptions.LoginRequiredException:
+        await status.edit_text("❌ Story ko'rish uchun login kerak (INSTAGRAM_USERNAME va INSTAGRAM_PASSWORD .env ga qo'shing)")
+    except Exception as e:
+        err = str(e)[:140]
+        print(f"❌ Story error: {err}")
+        try:
+            await status.edit_text(f"❌ Xato: {err}")
+        except:
+            await update.message.reply_text(f"❌ Xato: {err}")
+    finally:
+        try:
+            temp_dir_obj.cleanup()
+        except:
+            pass
+        if tmp.exists():
+            shutil.rmtree(str(tmp), ignore_errors=True)
+        print(f"🧹 Cleaned: {tmp}")
+        print(f"{'='*50}\n")
+
+
 # ================= ASOSIY HANDLER =================
 DOWNLOAD_SEM = asyncio.Semaphore(1)
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    
+    # Story link tekshirish
+    # Format: instagram.com/stories/username/story_id
+    story_match = re.search(r"/stories/([A-Za-z0-9_.]+)/(\d+)", text)
+    if story_match:
+        username = story_match.group(1)
+        story_id = story_match.group(2)
+        async with DOWNLOAD_SEM:
+            await download_story(update, username, story_id)
+        return
+    
+    # Oddiy username (barcha storylarni olish)
+    # Format: @username yoki instagram.com/username
+    username_match = re.search(r"(?:@|instagram\.com/)([A-Za-z0-9_.]+)/?$", text)
+    if username_match and "/p/" not in text and "/reel/" not in text and "/tv/" not in text and "/stories/" not in text:
+        username = username_match.group(1)
+        async with DOWNLOAD_SEM:
+            await download_story(update, username)
+        return
+    
+    # Post/Reel link
     shortcode = re.search(r"(?:/p/|/reel/|/tv/)([A-Za-z0-9_-]{10,})", text)
     shortcode = shortcode.group(1) if shortcode else None
 
     if not shortcode:
-        await update.message.reply_text("📎 Instagram post/reel link yuboring")
+        await update.message.reply_text(
+            "📎 Instagram link yuboring:\n\n"
+            "✅ Post/Reel: instagram.com/p/ABC123\n"
+            "✅ Story: instagram.com/stories/username/123456\n"
+            "✅ Barcha storylar: @username yoki instagram.com/username"
+        )
         return
 
     async with DOWNLOAD_SEM:
@@ -410,9 +530,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Salom! Instagram link yuboring → yuklab beraman\n\n"
-        "✅ Reel, post, carousel\n"
+        "✅ Post va Reel\n"
+        "✅ Carousel (ko'p rasmli)\n"
+        "✅ Story (yakka yoki barcha)\n"
         "✅ Video va rasmlar\n"
-        "✅ Avtomatik kompressiya"
+        "✅ Avtomatik kompressiya\n\n"
+        "📝 Qo'llanma:\n"
+        "• Post/Reel: link yuboring\n"
+        "• Story: instagram.com/stories/username/123\n"
+        "• Barcha story: @username"
     )
 
 

@@ -42,3 +42,5 @@ Cookies has been updated. Fixed only local cookies. Make sure to add cookies to 
 After getting your cookies ready, put them project folder by naming ```cookies.txt``` if you want to rename, change the ``` "cookiefile": "cookies.txt"``` from ```bot.py``` 
 
 Thats all, enjoy!
+
+btw, i already shut down this bot due server errors

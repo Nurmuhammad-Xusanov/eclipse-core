@@ -43,4 +43,4 @@ After getting your cookies ready, put them project folder by naming ```cookies.t
 
 Thats all, enjoy!
 
-btw, i already shut down this bot due server errors
+bot no more longer available 
